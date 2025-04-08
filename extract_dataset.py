@@ -9,7 +9,7 @@ output_dir = "dataset_real"
 
 # Step 1: Flatten folder structure
 for split in ["train", "test"]:
-    for season in ["spring", "summer", "autumn", "winter"]:
+    for season in ["Spring", "Summer", "Autumn", "Winter"]:
         os.makedirs(os.path.join(output_dir, split, season), exist_ok=True)
 
     input_split = os.path.join(input_dir, split)
