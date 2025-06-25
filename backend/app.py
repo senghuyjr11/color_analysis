@@ -10,7 +10,7 @@ from torchvision import transforms
 from torchvision.models import convnext_base, ConvNeXt_Base_Weights
 from sklearn.preprocessing import LabelEncoder
 from helper import is_human_face
-
+import torch.nn as nn
 
 # === Config ===
 client_initialized = False
@@ -100,8 +100,64 @@ async def predict(file: UploadFile = File(...)):
             "prediction": pred_label,
             "season": season,
             "subtype": subtype,
-            "confidence": float(probs[pred_idx])
+            "confidence": float(probs[pred_idx]),
+            "class_probabilities": dict(zip(emotion_labels, map(float, probs)))
         }
 
     except Exception as e:
         return {"error": str(e)}
+
+# Emotion Analysis Setup
+from torchvision.models import densenet121, DenseNet121_Weights
+
+emotion_model_path = "../models/best_densenet121_rafdb.pth"
+emotion_labels = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
+
+# Load emotion model once at startup
+emotion_model = densenet121(weights=DenseNet121_Weights.DEFAULT)
+emotion_model.classifier = nn.Sequential(
+    nn.Dropout(0.3),
+    nn.Linear(emotion_model.classifier.in_features, 7)
+)
+emotion_model.load_state_dict(torch.load(emotion_model_path, map_location=device))
+emotion_model.eval()
+emotion_model = emotion_model.to(device)
+
+# Emotion transform (same as test_tf)
+emotion_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
+])
+
+@app.post("/predict_emotion")
+async def predict_emotion(file: UploadFile = File(...)):
+    if not client_initialized:
+        return {"error": "Please call the root endpoint (/) before using this API."}
+
+    try:
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # Face check (reuse from color analysis)
+        if not is_human_face(image):
+            return {"error": "No human face detected in the image."}
+
+        # Transform and predict
+        input_tensor = emotion_transform(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = emotion_model(input_tensor)
+            probs = torch.nn.functional.softmax(logits, dim=1)[0].cpu().numpy()
+            pred_idx = int(np.argmax(probs))
+            pred_emotion = emotion_labels[pred_idx]
+
+        return {
+            "emotion": pred_emotion,
+            "confidence": float(probs[pred_idx]),
+            "class_probabilities": dict(zip(emotion_labels, map(float, probs)))
+        }
+
+    except Exception as e:
+        return {"error": f"Emotion prediction failed: {str(e)}"}

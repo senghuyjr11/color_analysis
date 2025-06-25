@@ -5,88 +5,14 @@ from torchvision.models import resnet50, ResNet50_Weights, convnext_tiny, ConvNe
 from PIL import Image
 from sklearn.preprocessing import LabelEncoder
 import pandas as pd
+import numpy as np
+import mediapipe as mp
 
 # === Device ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # === Emotion classes ===
 emotion_classes = ["neutral", "happy", "sad", "surprise", "fear", "disgust", "angry"]
-
-# === Expanded Color/Emotion Recommendations ===
-recommendations = {
-    "Winter/Deep": {
-        "happy": ["true red", "royal blue"],
-        "sad": ["plum", "charcoal"],
-        "angry": ["midnight navy", "steel"],
-        "neutral": ["black", "crimson"]
-    },
-    "Winter/Cool": {
-        "happy": ["icy blue", "pure white"],
-        "sad": ["gray", "cool lavender"],
-        "angry": ["teal", "steel gray"],
-        "neutral": ["navy", "frost"]
-    },
-    "Winter/Clear": {
-        "happy": ["electric blue", "crystal pink"],
-        "sad": ["deep magenta", "silver gray"],
-        "angry": ["jet black", "royal purple"],
-        "neutral": ["white", "cherry red"]
-    },
-    "Spring/Warm": {
-        "happy": ["coral", "sunny yellow"],
-        "sad": ["peach", "light apricot"],
-        "angry": ["mint", "cool beige"],
-        "neutral": ["ivory", "aqua"]
-    },
-    "Spring/Clear": {
-        "happy": ["buttercup", "sky blue"],
-        "sad": ["light orange", "blush"],
-        "angry": ["bright teal", "soft green"],
-        "neutral": ["light coral", "white"]
-    },
-    "Spring/Light": {
-        "happy": ["apricot", "baby blue"],
-        "sad": ["powder pink", "pale yellow"],
-        "angry": ["cool mint", "light aqua"],
-        "neutral": ["pearl", "light gray"]
-    },
-    "Summer/Cool": {
-        "happy": ["lavender", "soft pink"],
-        "sad": ["mauve", "dusty lilac"],
-        "angry": ["soft teal", "cool taupe"],
-        "neutral": ["light navy", "ash gray"]
-    },
-    "Summer/Light": {
-        "happy": ["sky blue", "soft lavender"],
-        "sad": ["dusty pink", "pale mauve"],
-        "angry": ["sage green", "taupe"],
-        "neutral": ["light gray", "powder blue"]
-    },
-    "Summer/Soft": {
-        "happy": ["blue-gray", "rosy beige"],
-        "sad": ["pale plum", "smoky mauve"],
-        "angry": ["cool stone", "muted teal"],
-        "neutral": ["soft white", "warm gray"]
-    },
-    "Autumn/Warm": {
-        "happy": ["terracotta", "pumpkin"],
-        "sad": ["mustard", "olive"],
-        "angry": ["deep orange", "earth brown"],
-        "neutral": ["camel", "caramel"]
-    },
-    "Autumn/Soft": {
-        "happy": ["rust", "warm peach"],
-        "sad": ["mustard", "olive drab"],
-        "angry": ["brown", "deep green"],
-        "neutral": ["beige", "earth gray"]
-    },
-    "Autumn/Deep": {
-        "happy": ["burnt sienna", "bronze"],
-        "sad": ["dark mustard", "wine red"],
-        "angry": ["forest green", "espresso"],
-        "neutral": ["dark olive", "chocolate"]
-    }
-}
 
 # === Rebuild label encoder from training CSV ===
 train_df = pd.read_csv("csv/train.csv")
@@ -121,10 +47,49 @@ emotion_model.fc = nn.Sequential(
 emotion_model.load_state_dict(torch.load("models/best_resnet50_rafdb.pth", map_location=device))
 emotion_model.to(device).eval()
 
+# === Background removal using MediaPipe FaceMesh ===
+def remove_background(image: Image.Image) -> Image.Image:
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing = mp.solutions.drawing_utils
+
+    image_np = np.array(image)
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+        results = face_mesh.process(image_np)
+
+        if not results.multi_face_landmarks:
+            return image  # return original image if no face is detected
+
+        h, w, _ = image_np.shape
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Get landmarks and draw a convex hull
+        face_points = []
+        for lm in results.multi_face_landmarks[0].landmark:
+            x, y = int(lm.x * w), int(lm.y * h)
+            face_points.append([x, y])
+
+        face_points = np.array(face_points)
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(face_points)
+        cv2 = __import__('cv2')
+        cv2.fillConvexPoly(mask, face_points[hull.vertices], 255)
+
+        # Apply mask
+        result = image_np.copy()
+        result[mask == 0] = 255  # white background
+        result_img = Image.fromarray(result)
+
+        return result_img
+
 # === Main prediction logic ===
 def predict_skin_and_emotion(image_path):
     image = Image.open(image_path).convert("RGB")
-    tensor = shared_transform(image).unsqueeze(0).to(device)
+
+    # Remove background first
+    face_only_image = remove_background(image)
+
+    # Apply transform
+    tensor = shared_transform(face_only_image).unsqueeze(0).to(device)
 
     with torch.no_grad():
         # Skin tone prediction
@@ -139,26 +104,11 @@ def predict_skin_and_emotion(image_path):
 
     return skin_label, emotion_label
 
-# === Recommendation logic ===
-def recommend_colors(skin_tone, emotion):
-    # Normalize to match dictionary key format
-    skin_tone = skin_tone.replace("_", "/").strip().title()  # "Spring_Clear" → "Spring/Clear"
-
-    tone_dict = recommendations.get(skin_tone)
-    if tone_dict:
-        return tone_dict.get(emotion, tone_dict.get("neutral", []))
-    return ["gray"]  # fallback
-
 
 # === Main Entry Point ===
 if __name__ == "__main__":
-    image_path = "clustered_seasons_kmeans/Spring/Clear/543.png"
+    image_path = "happy.jpg"
     skin_tone, emotion = predict_skin_and_emotion(image_path)
 
     print(f"\nDetected Emotion: {emotion}")
     print(f"Detected Skin Tone: {skin_tone}")
-
-    suggestions = recommend_colors(skin_tone, emotion)
-    print("\nSuggested Colors to Boost Mood & Match Tone:")
-    for color in suggestions:
-        print(" -", color)
