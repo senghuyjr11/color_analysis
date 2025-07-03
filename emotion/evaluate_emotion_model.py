@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet18, ResNet18_Weights  # FIXED: Use ResNet18
 from facenet_pytorch import MTCNN
-from PIL import Image
+from PIL import Image, ImageEnhance
 import pandas as pd
 import numpy as np
 import pickle
@@ -19,23 +19,59 @@ import seaborn as sns
 from tqdm.auto import tqdm
 
 
-# ------------------ Reuse Dataset and Model Classes (FIXED) ------------------
-class EmotionDataset(Dataset):
-    def __init__(self, csv_file, img_dir, transform=None, mtcnn=None):
+# ------------------ FIXED: Use EXACT same classes as training ------------------
+class RobustEmotionDataset(Dataset):
+    """EXACT COPY from training code"""
+
+    def __init__(self, csv_file, img_dir, transform=None, use_mtcnn=True, debug=False):
         self.data = pd.read_csv(csv_file)
         self.img_dir = img_dir
         self.transform = transform
-        self.mtcnn = mtcnn
+        self.debug = debug
+        self.use_mtcnn = use_mtcnn
+
+        # Initialize MTCNN with more lenient settings
+        if self.use_mtcnn:
+            self.mtcnn = MTCNN(
+                image_size=224,
+                margin=40,  # More margin for context
+                min_face_size=30,  # Smaller minimum face size
+                thresholds=[0.5, 0.6, 0.6],  # More lenient thresholds
+                factor=0.8,  # Better scale factor
+                post_process=True,
+                device='cuda' if torch.cuda.is_available() else 'cpu'
+            )
+        else:
+            self.mtcnn = None
 
         unique_labels = sorted(self.data["label"].dropna().unique())
         self.label_map = {label: idx for idx, label in enumerate(unique_labels)}
-        self.class_names = unique_labels
+        self.class_names = unique_labels  # Added for evaluation
         self.num_classes = len(unique_labels)
+        print(f"[{os.path.basename(csv_file)}] {self.num_classes} classes: {unique_labels}")
 
         self.data["label_idx"] = self.data["label"].map(self.label_map)
         self.data = self.data.dropna(subset=["label_idx"]).copy()
-        # FIXED: Use int64 to match training
         self.data["label_idx"] = self.data["label_idx"].astype('int64')
+
+        # Track statistics
+        self.mtcnn_success = 0
+        self.mtcnn_failure = 0
+        self.load_failure = 0
+
+    def enhance_image_quality(self, image):
+        """Enhance image quality before processing"""
+        # Enhance contrast and brightness
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.2)
+
+        enhancer = ImageEnhance.Brightness(image)
+        image = enhancer.enhance(1.1)
+
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.1)
+
+        return image
 
     def __len__(self):
         return len(self.data)
@@ -46,13 +82,68 @@ class EmotionDataset(Dataset):
 
         try:
             image = Image.open(img_path).convert("RGB")
+
+            # Enhance image quality
+            image = self.enhance_image_quality(image)
+
+            # Ensure minimum size
+            if image.size[0] < 100 or image.size[1] < 100:
+                image = image.resize((224, 224), Image.Resampling.LANCZOS)
+
             if self.mtcnn:
-                face = self.mtcnn(image)
-                if face is not None:
-                    image = transforms.ToPILImage()(face)
+                try:
+                    face = self.mtcnn(image)
+                    if face is not None:
+                        # Success: Convert tensor back to PIL
+                        image = transforms.ToPILImage()(face)
+                        self.mtcnn_success += 1
+
+                        if self.debug and idx < 10:
+                            print(f"Sample {idx}: MTCNN success")
+                    else:
+                        # MTCNN failed: Use original image with smart cropping
+                        self.mtcnn_failure += 1
+                        if self.debug and idx < 10:
+                            print(f"Sample {idx}: MTCNN failed, using smart crop")
+
+                        # Smart center crop focusing on upper portion (where faces usually are)
+                        w, h = image.size
+                        crop_size = min(w, h)
+
+                        # Focus on upper-center area
+                        left = (w - crop_size) // 2
+                        top = max(0, (h - crop_size) // 3)  # Upper third
+
+                        image = image.crop((left, top, left + crop_size, top + crop_size))
+                        image = image.resize((224, 224), Image.Resampling.LANCZOS)
+
+                except Exception as e:
+                    if self.debug:
+                        print(f"MTCNN error for {img_path}: {e}")
+                    self.mtcnn_failure += 1
+                    # Fall back to center crop
+                    w, h = image.size
+                    crop_size = min(w, h)
+                    left = (w - crop_size) // 2
+                    top = (h - crop_size) // 2
+                    image = image.crop((left, top, left + crop_size, top + crop_size))
+                    image = image.resize((224, 224), Image.Resampling.LANCZOS)
+            else:
+                # No MTCNN: Smart center crop
+                w, h = image.size
+                crop_size = min(w, h)
+                left = (w - crop_size) // 2
+                top = (h - crop_size) // 2
+                image = image.crop((left, top, left + crop_size, top + crop_size))
+                image = image.resize((224, 224), Image.Resampling.LANCZOS)
+
         except Exception as e:
-            print(f"[Warning] Failed to load {img_path}: {e}")
-            image = Image.new("RGB", (224, 224), (0, 0, 0))
+            if self.debug:
+                print(f"[ERROR] Failed to load {img_path}: {e}")
+            self.load_failure += 1
+
+            # Create a neutral gray image instead of black
+            image = Image.new("RGB", (224, 224), (128, 128, 128))
 
         if self.transform:
             image = self.transform(image)
@@ -60,111 +151,103 @@ class EmotionDataset(Dataset):
         return image, row["label_idx"]
 
 
-# ADDED: SimpleEmotionClassifier to match training
-class SimpleEmotionClassifier(nn.Module):
-    def __init__(self, in_features, num_classes):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Dropout(0.2),
-            nn.Linear(in_features, num_classes)
-        )
+class RobustEmotionClassifier(nn.Module):
+    """EXACT COPY from training code"""
 
-        # Simple initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        return self.classifier(x)
-
-
-class EmotionClassifier(nn.Module):
     def __init__(self, in_features, num_classes, dropout_rate=0.3):
         super().__init__()
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.LayerNorm((in_features,), eps=1e-6),
+            nn.BatchNorm1d(in_features),
             nn.Dropout(dropout_rate),
             nn.Linear(in_features, 512),
-            nn.GELU(),
+            nn.ReLU(inplace=True),
             nn.BatchNorm1d(512),
-            nn.Dropout(dropout_rate * 0.6),
-            nn.Linear(512, num_classes)
+            nn.Dropout(dropout_rate * 0.7),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(256, num_classes)
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         return self.classifier(x)
 
 
-def create_model_complex(num_classes, device):
-    """Create model with complex EmotionClassifier"""
-    base = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+def create_robust_model(num_classes, device):
+    """EXACT COPY from training code"""
+    print("🔧 Creating robust emotion model...")
+
+    # FIXED: Use ResNet18 to match training
+    base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+
     in_features = base.fc.in_features
-    base.fc = EmotionClassifier(in_features, num_classes)
-    return base.to(device)
+    base.fc = RobustEmotionClassifier(in_features, num_classes)
+
+    model = base.to(device)
+
+    # Test forward pass
+    model.eval()
+    test_input = torch.randn(2, 3, 224, 224).to(device)
+    with torch.no_grad():
+        output = model(test_input)
+        print(f"✅ Model test successful: {output.shape}")
+    model.train()
+
+    return model
 
 
-def create_model_simple(num_classes, device):
-    """Create model with SimpleEmotionClassifier"""
-    base = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-    in_features = base.fc.in_features
-    base.fc = SimpleEmotionClassifier(in_features, num_classes)
-    return base.to(device)
-
-
-def load_model_smart(model_path, num_classes, device):
-    """Intelligently load model by detecting its architecture"""
+def load_model_correct(model_path, num_classes, device):
+    """Load model with correct architecture matching training"""
     print(f"🔍 Loading model from: {model_path}")
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found at {model_path}")
 
-    # Load state dict to inspect structure
+    # Create the exact same model as training
+    model = create_robust_model(num_classes, device)
+
+    # Load state dict
     state_dict = torch.load(model_path, map_location=device)
-    fc_keys = [k for k in state_dict.keys() if k.startswith('fc.')]
-    print(f"📋 FC layer keys found: {fc_keys}")
 
-    # Determine architecture and create matching model
-    if 'fc.classifier.1.weight' in state_dict and 'fc.classifier.3.weight' in state_dict:
-        print("✅ Detected: Complex EmotionClassifier architecture")
-        model = create_model_complex(num_classes, device)
+    # Check if keys match
+    model_keys = set(model.state_dict().keys())
+    loaded_keys = set(state_dict.keys())
 
-    elif 'fc.classifier.2.weight' in state_dict and 'fc.classifier.2.bias' in state_dict:
-        print("✅ Detected: SimpleEmotionClassifier architecture")
-        # This is SimpleEmotionClassifier: Flatten(0), Dropout(1), Linear(2)
-        model = create_model_simple(num_classes, device)
+    if model_keys != loaded_keys:
+        print("⚠️  Key mismatch detected!")
+        print(f"Missing in loaded: {model_keys - loaded_keys}")
+        print(f"Extra in loaded: {loaded_keys - model_keys}")
 
-    elif 'fc.1.weight' in state_dict and 'fc.1.bias' in state_dict:
-        print("⚠️  Detected: Sequential(Flatten, Linear) architecture")
-        # Recreate the simple structure
-        model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-        fc1_weight_shape = state_dict['fc.1.weight'].shape
-        in_features = fc1_weight_shape[1]
-        out_features = fc1_weight_shape[0]
+        # Try to handle some common naming differences
+        if 'fc.classifier.0.weight' in loaded_keys and 'fc.classifier.1.weight' in loaded_keys:
+            print("✅ Detected: RobustEmotionClassifier architecture")
+        else:
+            raise ValueError("Cannot match model architecture!")
 
-        model.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_features, out_features)
-        )
-        model = model.to(device)
-
-    elif 'fc.weight' in state_dict:
-        print("⚠️  Detected: Simple Linear fc architecture")
-        model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-        model = model.to(device)
-
-    else:
-        raise ValueError(f"Unrecognized model architecture. FC keys: {fc_keys}")
-
-    # Load the state dict
     model.load_state_dict(state_dict)
     print(f"✅ Model loaded successfully!")
 
     return model
+
+
+# ------------------ FIXED: Use same transforms as training ------------------
+val_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
 
 # ------------------ Evaluation Functions ------------------
@@ -179,7 +262,6 @@ def evaluate_model(model, test_loader, device, class_names):
     with torch.no_grad():
         for imgs, labels in tqdm(test_loader, desc="Evaluating"):
             imgs, labels = imgs.to(device), labels.to(device)
-            # ENSURE labels are Long type
             labels = labels.long()
 
             with torch.autocast(device_type=device.type,
@@ -240,48 +322,8 @@ def plot_confusion_matrix(y_true, y_pred, class_names, save_path='results/confus
     plt.show()
 
 
-def analyze_predictions(y_true, y_pred, y_probs, class_names):
-    """Analyze prediction patterns and confidence"""
-    correct_mask = (y_true == y_pred)
-    max_probs = np.max(y_probs, axis=1)
-
-    print(f"\n{'=' * 60}")
-    print("🔍 PREDICTION ANALYSIS:")
-    print(f"{'=' * 60}")
-    print(f"✅ Correct predictions: {correct_mask.sum()}/{len(y_true)} ({correct_mask.mean():.4f})")
-    print(f"📈 Average confidence (correct): {max_probs[correct_mask].mean():.4f}")
-    print(f"📉 Average confidence (incorrect): {max_probs[~correct_mask].mean():.4f}")
-
-    # Confidence distribution
-    print(f"\n📊 CONFIDENCE DISTRIBUTION:")
-    confidence_ranges = [(0.0, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.0)]
-    for low, high in confidence_ranges:
-        mask = (max_probs >= low) & (max_probs < high)
-        accuracy_in_range = correct_mask[mask].mean() if mask.sum() > 0 else 0
-        print(f"   {low:.1f}-{high:.1f}: {mask.sum():4d} samples, accuracy: {accuracy_in_range:.3f}")
-
-    # Most confused classes
-    cm = confusion_matrix(y_true, y_pred)
-    np.fill_diagonal(cm, 0)  # Remove correct predictions
-    most_confused = np.unravel_index(cm.argmax(), cm.shape)
-    print(f"\n🤔 Most confused classes:")
-    print(f"   {class_names[most_confused[0]]} → {class_names[most_confused[1]]}: {cm[most_confused]} times")
-
-    # Find other highly confused pairs
-    confused_pairs = []
-    for i in range(len(class_names)):
-        for j in range(len(class_names)):
-            if i != j and cm[i, j] > 0:
-                confused_pairs.append((cm[i, j], class_names[i], class_names[j]))
-
-    confused_pairs.sort(reverse=True)
-    print(f"   Top confusion pairs:")
-    for count, true_class, pred_class in confused_pairs[:3]:
-        print(f"     {true_class} → {pred_class}: {count} times")
-
-
-def plot_training_history(history_path='models/training_history.pkl', save_path='results/training_curves.png'):
-    """Plot comprehensive training history"""
+def plot_training_history(history_path='models/training_history_v2.pkl', save_path='results/training_curves.png'):
+    """Plot training history - FIXED to use correct path"""
     try:
         with open(history_path, 'rb') as f:
             history = pickle.load(f)
@@ -289,7 +331,6 @@ def plot_training_history(history_path='models/training_history.pkl', save_path=
         print(f"\n📈 TRAINING HISTORY ANALYSIS:")
 
         if isinstance(history, dict) and 'train_loss' in history:
-            # Complete history with train/val loss and accuracy
             epochs = range(1, len(history['val_loss']) + 1)
 
             fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
@@ -312,15 +353,15 @@ def plot_training_history(history_path='models/training_history.pkl', save_path=
             ax2.legend()
             ax2.grid(True, alpha=0.3)
 
-            # Learning curve (val accuracy vs train accuracy)
+            # Learning curve
             ax3.plot(history['train_acc'], history['val_acc'], 'go-', alpha=0.7)
-            ax3.plot([0, 1], [0, 1], 'k--', alpha=0.5)  # Perfect correlation line
+            ax3.plot([0, 1], [0, 1], 'k--', alpha=0.5)
             ax3.set_title('Learning Curve (Train vs Val Accuracy)', fontsize=14, fontweight='bold')
             ax3.set_xlabel('Train Accuracy')
             ax3.set_ylabel('Validation Accuracy')
             ax3.grid(True, alpha=0.3)
 
-            # Loss difference (overfitting indicator)
+            # Loss difference
             loss_diff = np.array(history['train_loss']) - np.array(history['val_loss'])
             ax4.plot(epochs, loss_diff, 'purple', linewidth=2)
             ax4.axhline(y=0, color='k', linestyle='--', alpha=0.5)
@@ -330,39 +371,15 @@ def plot_training_history(history_path='models/training_history.pkl', save_path=
             ax4.grid(True, alpha=0.3)
 
             plt.tight_layout()
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"📈 Training curves saved to: {save_path}")
+            plt.show()
 
-            # Print summary statistics
+            # Print summary
             best_val_acc = max(history['val_acc'])
             best_val_epoch = history['val_acc'].index(best_val_acc) + 1
-            final_val_acc = history['val_acc'][-1]
-
             print(f"📊 Training Summary:")
-            print(f"   Total epochs: {len(epochs)}")
             print(f"   Best validation accuracy: {best_val_acc:.4f} (epoch {best_val_epoch})")
-            print(f"   Final validation accuracy: {final_val_acc:.4f}")
-            print(f"   Improvement: {(best_val_acc - history['val_acc'][0]):.4f}")
-
-        elif isinstance(history, list):
-            # Simple validation loss history (from old format)
-            val_losses = history
-            epochs = range(1, len(val_losses) + 1)
-
-            plt.figure(figsize=(10, 6))
-            plt.plot(epochs, val_losses, 'b-', label='Validation Loss', linewidth=2)
-            plt.title('Training History (Validation Loss)', fontsize=14, fontweight='bold')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-
-            print(f"📊 Training Summary (Loss only):")
-            print(f"   Total epochs: {len(val_losses)}")
-            print(f"   Best validation loss: {min(val_losses):.4f} (epoch {val_losses.index(min(val_losses)) + 1})")
-            print(f"   Final validation loss: {val_losses[-1]:.4f}")
-
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"📈 Training curves saved to: {save_path}")
-        plt.show()
 
     except FileNotFoundError:
         print(f"⚠️  Training history not found at {history_path}")
@@ -422,42 +439,98 @@ def generate_prediction_samples(model, test_loader, device, class_names, save_pa
     plt.show()
 
 
+def analyze_predictions(y_true, y_pred, y_probs, class_names):
+    """Analyze prediction patterns and confidence"""
+    correct_mask = (y_true == y_pred)
+    max_probs = np.max(y_probs, axis=1)
+
+    print(f"\n{'=' * 60}")
+    print("🔍 PREDICTION ANALYSIS:")
+    print(f"{'=' * 60}")
+    print(f"✅ Correct predictions: {correct_mask.sum()}/{len(y_true)} ({correct_mask.mean():.4f})")
+    print(f"📈 Average confidence (correct): {max_probs[correct_mask].mean():.4f}")
+    print(f"📉 Average confidence (incorrect): {max_probs[~correct_mask].mean():.4f}")
+
+    # Confidence distribution
+    print(f"\n📊 CONFIDENCE DISTRIBUTION:")
+    confidence_ranges = [(0.0, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.0)]
+    for low, high in confidence_ranges:
+        mask = (max_probs >= low) & (max_probs < high)
+        accuracy_in_range = correct_mask[mask].mean() if mask.sum() > 0 else 0
+        print(f"   {low:.1f}-{high:.1f}: {mask.sum():4d} samples, accuracy: {accuracy_in_range:.3f}")
+
+    # Most confused classes
+    cm = confusion_matrix(y_true, y_pred)
+    np.fill_diagonal(cm, 0)  # Remove correct predictions
+    most_confused = np.unravel_index(cm.argmax(), cm.shape)
+    print(f"\n🤔 Most confused classes:")
+    print(f"   {class_names[most_confused[0]]} → {class_names[most_confused[1]]}: {cm[most_confused]} times")
+
+    # Find other highly confused pairs
+    confused_pairs = []
+    for i in range(len(class_names)):
+        for j in range(len(class_names)):
+            if i != j and cm[i, j] > 0:
+                confused_pairs.append((cm[i, j], class_names[i], class_names[j]))
+
+    confused_pairs.sort(reverse=True)
+    print(f"   Top confusion pairs:")
+    for count, true_class, pred_class in confused_pairs[:3]:
+        print(f"     {true_class} → {pred_class}: {count} times")
+
+
 # ------------------ Main Evaluation Function ------------------
 def main():
-    print("🎯 EMOTION MODEL EVALUATION (FIXED)")
+    print("🎯 FIXED EMOTION MODEL EVALUATION")
     print("=" * 60)
 
-    # CREATE RESULTS DIRECTORY FIRST
+    # Create results directory
     os.makedirs('results', exist_ok=True)
     print("📁 Created results directory")
 
-    # Setup
+    # Setup device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Data setup - MATCH TRAINING (NO MTCNN)
-    mtcnn = None  # Disabled to match training
+    # FIXED: Match training setup exactly
     base_path = "archive/data_balanced_1x"
     test_csv = os.path.join(base_path, "test.csv")
     test_dir = os.path.join(base_path, "test")
 
-    val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    # STEP 1: Determine MTCNN usage (same logic as training)
+    print("\n🧪 Determining MTCNN usage...")
 
-    test_set = EmotionDataset(test_csv, test_dir, transform=val_transform, mtcnn=mtcnn)
-    test_loader = DataLoader(test_set, batch_size=48, shuffle=False,
-                             num_workers=6, pin_memory=True)
+    # Try to match training's decision logic
+    use_mtcnn = False  # Default to False like training often does
+
+    # You can override this based on your training logs:
+    # If training used MTCNN successfully, set use_mtcnn = True
+
+    print(f"🔧 Using MTCNN: {use_mtcnn} (matching training)")
+
+    # FIXED: Use exact same dataset class and transforms
+    test_set = RobustEmotionDataset(
+        test_csv,
+        test_dir,
+        transform=val_transform,
+        use_mtcnn=use_mtcnn,
+        debug=False
+    )
+
+    test_loader = DataLoader(
+        test_set,
+        batch_size=32,  # Match training batch size
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
 
     print(f"📋 Test set: {len(test_set)} samples, {test_set.num_classes} classes")
     print(f"📋 Classes: {test_set.class_names}")
-    print(f"⚠️  MTCNN: {'Enabled' if mtcnn else 'Disabled'} (matching training)")
 
-    # Load model with smart detection
-    model_path = 'models/best_emotion_model.pth'
-    model = load_model_smart(model_path, test_set.num_classes, device)
+    # FIXED: Load model with correct architecture
+    model_path = 'models/emotion_model_v2.pth'  # Match training save path
+    model = load_model_correct(model_path, test_set.num_classes, device)
 
     # Run evaluation
     print(f"\n{'=' * 60}")
@@ -466,14 +539,14 @@ def main():
 
     y_pred, y_true, y_probs = evaluate_model(model, test_loader, device, test_set.class_names)
 
-    # Generate all analysis
+    # Generate all analysis and plots
     print_metrics(y_true, y_pred, test_set.class_names)
     plot_confusion_matrix(y_true, y_pred, test_set.class_names)
     analyze_predictions(y_true, y_pred, y_probs, test_set.class_names)
-    plot_training_history()
+    plot_training_history()  # Uses correct path
     generate_prediction_samples(model, test_loader, device, test_set.class_names)
 
-    # Save comprehensive results
+    # Save results
     results = {
         'accuracy': accuracy_score(y_true, y_pred),
         'predictions': y_pred,
@@ -495,8 +568,7 @@ def main():
     print("   - results/training_curves.png (learning progression)")
     print("   - results/prediction_samples.png (visual predictions)")
     print("   - results/evaluation_results.npy (complete results)")
-    print(
-        f"\n🏆 Final Test Accuracy: {accuracy_score(y_true, y_pred):.4f} ({accuracy_score(y_true, y_pred) * 100:.2f}%)")
+    print(f"🏆 Final Test Accuracy: {accuracy_score(y_true, y_pred):.4f} ({accuracy_score(y_true, y_pred) * 100:.2f}%)")
 
 
 if __name__ == '__main__':
