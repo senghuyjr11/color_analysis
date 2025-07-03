@@ -384,6 +384,142 @@ def analyze_predictions(y_true, y_pred, y_probs, class_names):
         print(f"     {true_class} -> {pred_class}: {count} times")
 
 
+def plot_per_class_metrics(y_true, y_pred, class_names, save_path='results/per_class_metrics.png'):
+    """Plot per-class precision, recall, and F1-score as bar charts"""
+    from sklearn.metrics import precision_recall_fscore_support
+
+    # Calculate per-class metrics
+    precision, recall, f1, support = precision_recall_fscore_support(y_true, y_pred, average=None)
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    x = np.arange(len(class_names))
+    width = 0.25
+
+    # Create bars
+    bars1 = ax.bar(x - width, precision, width, label='Precision', alpha=0.8, color='skyblue')
+    bars2 = ax.bar(x, recall, width, label='Recall', alpha=0.8, color='lightgreen')
+    bars3 = ax.bar(x + width, f1, width, label='F1-Score', alpha=0.8, color='salmon')
+
+    # Add value labels on bars
+    def add_value_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2., height + 0.01,
+                    f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+
+    add_value_labels(bars1)
+    add_value_labels(bars2)
+    add_value_labels(bars3)
+
+    # Customize the plot
+    ax.set_xlabel('Emotion Classes', fontsize=12)
+    ax.set_ylabel('Score', fontsize=12)
+    ax.set_title('Per-Class Performance Metrics', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_names, rotation=45, ha='right')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1.1)
+
+    # Add sample count annotations
+    for i, (class_name, count) in enumerate(zip(class_names, support)):
+        ax.text(i, 0.05, f'n={count}', ha='center', va='bottom',
+                fontsize=8, style='italic', color='gray')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Per-class metrics saved to: {save_path}")
+    plt.show()
+
+    # Print detailed metrics table
+    print(f"\n{'=' * 80}")
+    print("DETAILED PER-CLASS METRICS")
+    print(f"{'=' * 80}")
+    print(f"{'Class':<12} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
+    print("-" * 80)
+    for i, class_name in enumerate(class_names):
+        print(f"{class_name:<12} {precision[i]:<10.4f} {recall[i]:<10.4f} {f1[i]:<10.4f} {support[i]:<10}")
+
+    # Overall metrics
+    macro_avg_precision = np.mean(precision)
+    macro_avg_recall = np.mean(recall)
+    macro_avg_f1 = np.mean(f1)
+
+    print("-" * 80)
+    print(
+        f"{'Macro Avg':<12} {macro_avg_precision:<10.4f} {macro_avg_recall:<10.4f} {macro_avg_f1:<10.4f} {np.sum(support):<10}")
+
+
+def plot_roc_curves_per_class(y_true, y_probs, class_names, save_path='results/roc_curves_per_class.png'):
+    """Plot ROC curves for each class (one-vs-all)"""
+    from sklearn.metrics import roc_curve, auc
+    from sklearn.preprocessing import label_binarize
+
+    # Binarize the output for multiclass ROC
+    y_true_bin = label_binarize(y_true, classes=range(len(class_names)))
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # Colors for each class
+    colors = plt.cm.Set3(np.linspace(0, 1, len(class_names)))
+
+    # Plot ROC curve for each class
+    for i, (class_name, color) in enumerate(zip(class_names, colors)):
+        # Get probabilities for this class
+        y_score = y_probs[:, i]
+
+        # Calculate ROC curve
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_score)
+        roc_auc = auc(fpr, tpr)
+
+        # Plot the curve
+        ax.plot(fpr, tpr, color=color, linewidth=2,
+                label=f'{class_name} (AUC = {roc_auc:.3f})')
+
+    # Plot random classifier line
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=2, alpha=0.5, label='Random Classifier')
+
+    # Customize the plot
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title('ROC Curves for Each Emotion Class (One-vs-All)', fontsize=14, fontweight='bold')
+    ax.legend(loc="lower right", fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"ROC curves saved to: {save_path}")
+    plt.show()
+
+    # Print AUC summary
+    print(f"\n{'=' * 60}")
+    print("AREA UNDER THE CURVE (AUC) SUMMARY")
+    print(f"{'=' * 60}")
+
+    auc_scores = []
+    for i, class_name in enumerate(class_names):
+        y_score = y_probs[:, i]
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_score)
+        roc_auc = auc(fpr, tpr)
+        auc_scores.append(roc_auc)
+        print(f"{class_name:<15}: {roc_auc:.4f}")
+
+    print("-" * 60)
+    print(f"{'Mean AUC':<15}: {np.mean(auc_scores):.4f}")
+    print(f"{'Std AUC':<15}: {np.std(auc_scores):.4f}")
+
+    # Find best and worst performing classes
+    best_idx = np.argmax(auc_scores)
+    worst_idx = np.argmin(auc_scores)
+    print(f"\nBest performing class: {class_names[best_idx]} (AUC = {auc_scores[best_idx]:.4f})")
+    print(f"Worst performing class: {class_names[worst_idx]} (AUC = {auc_scores[worst_idx]:.4f})")
+
+
 def plot_training_history(history_path='models/training_history_efficientnet.pkl',
                           save_path='results/training_curves.png'):
     """Plot comprehensive training history - FIXED PATH"""
@@ -609,6 +745,12 @@ def main():
     # Comparison confusion matrices
     plot_comparison_confusion_matrix(y_true, y_pred_baseline, y_pred_improved, test_set.class_names)
 
+    # Per-class performance metrics
+    plot_per_class_metrics(y_true, y_pred_improved, test_set.class_names)
+
+    # ROC curves for each class
+    plot_roc_curves_per_class(y_true, y_probs_improved, test_set.class_names)
+
     # Detailed analysis for improved model
     analyze_predictions(y_true, y_pred_improved, y_probs_improved, test_set.class_names)
 
@@ -644,6 +786,8 @@ def main():
     print(f"{'=' * 60}")
     print("Files generated:")
     print("   - results/comparison_confusion_matrix.png (baseline vs improved)")
+    print("   - results/per_class_metrics.png (precision/recall/F1 per class)")
+    print("   - results/roc_curves_per_class.png (ROC curves for each emotion)")
     print("   - results/training_curves.png (learning progression)")
     print("   - results/prediction_samples.png (visual predictions)")
     print("   - results/comprehensive_evaluation_results.npy (all results)")
