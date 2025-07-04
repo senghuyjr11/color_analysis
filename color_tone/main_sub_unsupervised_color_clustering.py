@@ -8,13 +8,14 @@ import torch
 from tqdm import tqdm
 from transformers import CLIPProcessor, CLIPModel
 
-# === Paths ===
-input_dir = "dataset/all_faces"
-output_dir = "clustered_seasons_kmeans"
-os.makedirs(output_dir, exist_ok=True)
+# === Settings ===
+input_dir = "../clustered_seasons_kmeans/Winter"
+output_base = "clustered_seasons_kmeans/Winter"
+n_subclusters = 3
 
 # === Load CLIP model ===
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(device)
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
@@ -37,17 +38,17 @@ for fname in tqdm(os.listdir(input_dir)):
 features = np.vstack(features)
 scaled = StandardScaler().fit_transform(features)
 
-# === Cluster (KMeans) ===
-kmeans = KMeans(n_clusters=4, random_state=42)
+# === KMeans Sub-clustering ===
+kmeans = KMeans(n_clusters=n_subclusters, random_state=42)
 labels = kmeans.fit_predict(scaled)
 
-# === Save clustered images ===
-for cluster_id in range(4):
-    os.makedirs(os.path.join(output_dir, f"Cluster_{cluster_id}"), exist_ok=True)
+# === Save to subfolders ===
+for sub_id in range(n_subclusters):
+    os.makedirs(os.path.join(output_base, f"Sub_{sub_id}"), exist_ok=True)
 
 for fname, label in zip(filenames, labels):
     src = os.path.join(input_dir, fname)
-    dst = os.path.join(output_dir, f"Cluster_{label}", fname)
-    shutil.copyfile(src, dst)
+    dst = os.path.join(output_base, f"Sub_{label}", fname)
+    shutil.move(src, dst)  # Move instead of copy to avoid duplication
 
-print("✅ Clustering completed. Check the folders under:", output_dir)
+print("Winter sub-clustering complete.")

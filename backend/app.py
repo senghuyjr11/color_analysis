@@ -16,7 +16,7 @@ import torch.nn as nn
 client_initialized = False
 img_size = 224
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_path = "../models/color_convnext_fafl.pth"
+model_path = "../color_tone/models/color_convnext_fafl.pth"
 
 # === Use 12-class labels ===
 label_classes = [
@@ -110,7 +110,7 @@ async def predict(file: UploadFile = File(...)):
 # Emotion Analysis Setup
 from torchvision.models import densenet121, DenseNet121_Weights
 
-emotion_model_path = "../models/best_densenet121_rafdb.pth"
+emotion_model_path = "../color_tone/models/best_densenet121_rafdb.pth"
 emotion_labels = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
 
 # Load emotion model once at startup
