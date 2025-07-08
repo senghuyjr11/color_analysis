@@ -10,7 +10,7 @@ from transformers import CLIPProcessor, CLIPModel
 
 # === Paths ===
 input_dir = "dataset/all_faces"
-output_dir = "../clustered_seasons_kmeans"
+output_dir = "clustered_seasons_kmeans"
 os.makedirs(output_dir, exist_ok=True)
 
 # === Load CLIP model ===

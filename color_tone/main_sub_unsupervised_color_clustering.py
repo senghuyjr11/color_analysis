@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import CLIPProcessor, CLIPModel
 
 # === Settings ===
-input_dir = "../clustered_seasons_kmeans/Winter"
+input_dir = "clustered_seasons_kmeans/Winter"
 output_base = "clustered_seasons_kmeans/Winter"
 n_subclusters = 3
 
