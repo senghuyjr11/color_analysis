@@ -24,23 +24,22 @@ def extract_hsv_features(folder):
     return np.mean(hsv_features, axis=0)
 
 # === Paths ===
-cluster_root = "clustered_seasons_kmeans/Spring"
-
+cluster_root = "fake_dataset/main_season/spring"
 clusters = sorted([d for d in os.listdir(cluster_root) if d.startswith("Sub_")])
-tones = ["Light", "Warm", "Clear"]  # Typical Spring subtypes
+tones = ["light", "warm", "bright"]  # Spring tone categories
 
 # === Extract features ===
-print("🔍 Extracting features...")
+print("🔍 Extracting HSV features...")
 cluster_features = {c: extract_hsv_features(os.path.join(cluster_root, c)) for c in tqdm(clusters)}
 
-# === Simulated tone vectors for consistent structure
+# === Simulated tone vectors for consistent mapping
 tone_vectors = {
-    "Light": np.array([45, 40, 90] + [0.1]*8),
-    "Warm": np.array([40, 80, 75] + [0.12]*8),
-    "Clear": np.array([50, 100, 85] + [0.11]*8),
+    "light": np.array([45, 40, 90] + [0.1]*8),
+    "warm": np.array([40, 80, 75] + [0.12]*8),
+    "bright": np.array([50, 100, 85] + [0.11]*8),
 }
 
-# === Best unique mapping
+# === Find best cluster-to-tone mapping
 best_mapping = {}
 best_total_dist = float("inf")
 
@@ -55,7 +54,10 @@ for perm in itertools.permutations(tones):
         best_total_dist = total_dist
         best_mapping = temp_map
 
-# === Print result
-print("\n✅ Best Sub-Cluster to Spring Tone Mapping (based on HSV):")
+# === Rename folders
+print("\n✅ Best Sub-Cluster to Spring Tone Mapping:")
 for cluster, tone in best_mapping.items():
-    print(f"  {cluster} → {tone} Spring")
+    old_path = os.path.join(cluster_root, cluster)
+    new_path = os.path.join(cluster_root, tone)
+    os.rename(old_path, new_path)
+    print(f"  {cluster} → {tone}")

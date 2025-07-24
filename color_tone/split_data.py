@@ -1,40 +1,40 @@
-import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-def collect_image_paths(base_dir):
-    data = []
-    for season in os.listdir(base_dir):
-        season_path = os.path.join(base_dir, season)
-        if not os.path.isdir(season_path):
-            continue
-        for tone in os.listdir(season_path):
-            tone_path = os.path.join(season_path, tone)
-            if not os.path.isdir(tone_path):
-                continue
-            label = f"{season}_{tone}"
-            for fname in os.listdir(tone_path):
-                if fname.lower().endswith(('.jpg', '.png', '.jpeg')):
-                    full_path = os.path.join(base_dir, season, tone, fname)
-                    data.append((full_path.replace("\\", "/"), label))
-    return data
+# === 1. Folder name fix: Italian → English ===
+folder_map = {
+    'autunno': 'autumn',
+    'primavera': 'spring',
+    'estate': 'summer',
+    'inverno': 'winter'
+}
 
-# Base directory
-base = "ORIGINAL_RGB_NOT_PROCESSED"
-train_data = collect_image_paths(os.path.join(base, "train"))
-test_data = collect_image_paths(os.path.join(base, "test"))
+def fix_paths(df):
+    for it, en in folder_map.items():
+        df['path'] = df['path'].str.replace(f"/{it}/", f"/{en}/", regex=False)
+    return df
 
-# Split 15% validation from train
-train_list, val_list = train_test_split(train_data, test_size=0.15, stratify=[x[1] for x in train_data], random_state=42)
+# Load original train CSV
+train_df = pd.read_csv('./ORIGINAL_RGB_NOT_PROCESSED/cleaned_train.csv')
+train_df = fix_paths(train_df)
 
-# Convert to DataFrame
-df_train = pd.DataFrame(train_list, columns=["path", "label"])
-df_val = pd.DataFrame(val_list, columns=["path", "label"])
-df_test = pd.DataFrame(test_data, columns=["path", "label"])
+# === 2. Stratified Train/Val split ===
+train_part, val_part = train_test_split(
+    train_df,
+    test_size=0.15,
+    stratify=train_df['label'],
+    random_state=42
+)
 
-# Save
-df_train.to_csv("ORIGINAL_RGB_NOT_PROCESSED/train.csv", index=False)
-df_val.to_csv("ORIGINAL_RGB_NOT_PROCESSED/val.csv", index=False)
-df_test.to_csv("ORIGINAL_RGB_NOT_PROCESSED/test.csv", index=False)
+# === 3. Load and fix test CSV too ===
+val_part = fix_paths(val_part)
+test_df = pd.read_csv('./ORIGINAL_RGB_NOT_PROCESSED/cleaned_test.csv')
+test_df = fix_paths(test_df)
 
-print("CSV files created successfully.")
+# === 4. Save all cleaned/fixed files ===
+train_part.to_csv('./ORIGINAL_RGB_NOT_PROCESSED/cleaned_train.csv', index=False)
+val_part.to_csv('./ORIGINAL_RGB_NOT_PROCESSED/cleaned_val.csv', index=False)
+test_df.to_csv('./ORIGINAL_RGB_NOT_PROCESSED/cleaned_test.csv', index=False)
+
+print(f"✅ Folder names fixed and new val split created.")
+print(f"✅ Train: {len(train_part)} | Val: {len(val_part)} | Test: {len(test_df)}")

@@ -24,20 +24,21 @@ def extract_hsv_features(folder):
     return np.mean(hsv_features, axis=0)
 
 # === Paths ===
-cluster_root = "clustered_seasons_kmeans/Winter"
-
+cluster_root = "fake_dataset/main_season/winter"
 clusters = sorted([d for d in os.listdir(cluster_root) if d.startswith("Sub_")])
-tones = ["Cool", "Deep", "Clear"]  # Typical Winter subtones
+tones = ["cool", "deep", "bright"]  # Winter tones
 
 # === Extract features ===
-print("🔍 Extracting features...")
-cluster_features = {c: extract_hsv_features(os.path.join(cluster_root, c)) for c in tqdm(clusters)}
+print("🔍 Extracting HSV features...")
+cluster_features = {
+    c: extract_hsv_features(os.path.join(cluster_root, c)) for c in tqdm(clusters)
+}
 
 # === Simulated tone vectors
 tone_vectors = {
-    "Cool": np.array([170, 50, 80] + [0.1]*8),
-    "Deep": np.array([160, 70, 50] + [0.12]*8),
-    "Clear": np.array([175, 100, 90] + [0.11]*8),
+    "cool": np.array([170, 50, 80] + [0.1]*8),
+    "deep": np.array([160, 70, 50] + [0.12]*8),
+    "bright": np.array([175, 100, 90] + [0.11]*8),
 }
 
 # === Best unique mapping
@@ -55,7 +56,10 @@ for perm in itertools.permutations(tones):
         best_total_dist = total_dist
         best_mapping = temp_map
 
-# === Print result
-print("Best Sub-Cluster to Winter Tone Mapping (based on HSV):")
+# === Rename folders
+print("\n✅ Best Sub-Cluster to Winter Tone Mapping:")
 for cluster, tone in best_mapping.items():
-    print(f"  {cluster} → {tone} Winter")
+    old_path = os.path.join(cluster_root, cluster)
+    new_path = os.path.join(cluster_root, tone)
+    os.rename(old_path, new_path)
+    print(f"  {cluster} → {tone}")

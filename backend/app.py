@@ -1,22 +1,28 @@
-import os
 import io
-import torch
-import uvicorn
+import io
+
 import numpy as np
+import torch
+import torch.nn as nn
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from sklearn.preprocessing import LabelEncoder
 from torchvision import transforms
 from torchvision.models import convnext_base, ConvNeXt_Base_Weights
-from sklearn.preprocessing import LabelEncoder
-from helper import is_human_face
-import torch.nn as nn
+
+from helper import (
+    is_human_face,
+    season_tone_palettes,
+    palette_to_vector,
+    save_palette_image
+)
 
 # === Config ===
 client_initialized = False
 img_size = 224
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_path = "../color_tone/models/color_convnext_fafl.pth"
+model_path = "../color_tone/model/color_convnext_fafl.pth"
 
 # === Use 12-class labels ===
 label_classes = [
@@ -96,21 +102,33 @@ async def predict(file: UploadFile = File(...)):
             pred_label = label_encoder.inverse_transform([pred_idx])[0]
 
         season, subtype = pred_label.split("_")
+        palette_hex = season_tone_palettes.get(pred_label, [])
+        palette_vec = palette_to_vector(palette_hex)
+        palette_path = save_palette_image(palette_hex, pred_label, file.filename)
+
         return {
-            "prediction": pred_label,
+            "predicted_label": pred_label,
+            "hex_palette": palette_hex,
+            "rgb_vector_15d": palette_vec.tolist(),
+            "palette_image_path": palette_path,
+            "message_lines": [
+                f"Predicted Label: {pred_label}",
+                f"HEX Palette: {palette_hex}",
+                f"RGB Vector (15D): {palette_vec}",
+                f"Palette image saved to: {palette_path}"
+            ],
             "season": season,
             "subtype": subtype,
             "confidence": float(probs[pred_idx]),
-            "class_probabilities": dict(zip(emotion_labels, map(float, probs)))
+            "class_probabilities": dict(zip(label_encoder.classes_, map(float, probs)))
         }
-
     except Exception as e:
         return {"error": str(e)}
 
 # Emotion Analysis Setup
 from torchvision.models import densenet121, DenseNet121_Weights
 
-emotion_model_path = "../color_tone/models/best_densenet121_rafdb.pth"
+emotion_model_path = "../color_tone/model/best_densenet121_rafdb.pth"
 emotion_labels = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
 
 # Load emotion model once at startup
