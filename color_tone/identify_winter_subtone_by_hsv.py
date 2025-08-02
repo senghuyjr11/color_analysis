@@ -24,7 +24,7 @@ def extract_hsv_features(folder):
     return np.mean(hsv_features, axis=0)
 
 # === Paths ===
-cluster_root = "fake_dataset/main_season/winter"
+cluster_root = "fake_dataset/main_season_ai_data/winter"
 clusters = sorted([d for d in os.listdir(cluster_root) if d.startswith("Sub_")])
 tones = ["cool", "deep", "bright"]  # Winter tones
 
