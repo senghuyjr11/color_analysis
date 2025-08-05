@@ -1,108 +1,174 @@
-import torch
-import torch.nn as nn
-from torchvision import transforms
-from torchvision.models import convnext_large
-from PIL import Image
 import os
-import pandas as pd
+import torch
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
-import heapq
+from PIL import Image
+import torch.nn.functional as F
+from torchvision import transforms
+import cv2
+from face_parsing.model import BiSeNet
 
-# === Settings ===
-IMG_SIZE = 224
+
+# ==== Paths ====
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(PROJECT_ROOT, "merge_dataset_cropped_segmented")
+WEIGHTS = os.path.join(PROJECT_ROOT, "face_parsing", "res", "cp", "79999_iter.pth")
+IMG_PATH = "ORIGINAL_RGB_NOT_PROCESSED/test/spring/warm/52.png"
+
+# ==== Device ====
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DATASET_DIR = "merge_dataset_cropped_segmented"
-MAIN_MODEL_PATH = os.path.join(DATASET_DIR, "convnext_season_large.pth")
 
-# === Image Transform ===
-predict_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+# ==== BiSeNet for Segmentation ====
+to_tensor = transforms.Compose([
+    transforms.Resize((512, 512)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 ])
 
-# === Load main model and label encoder
-main_train_csv = os.path.join(DATASET_DIR, "train.csv")
-main_df = pd.read_csv(main_train_csv)
-main_df['season'] = main_df['label'].apply(lambda x: x.split('_')[0])
-main_label_encoder = LabelEncoder()
-main_label_encoder.fit(main_df['season'])
-num_seasons = len(main_label_encoder.classes_)
+def load_face_segmenter():
+    model = BiSeNet(n_classes=19)
+    model.to(DEVICE)
+    model.load_state_dict(torch.load(WEIGHTS, map_location=DEVICE))
+    model.eval()
+    return model
 
-main_model = convnext_large(weights=None)
-main_model.classifier[2] = nn.Linear(main_model.classifier[2].in_features, num_seasons)
-main_model.load_state_dict(torch.load(MAIN_MODEL_PATH, map_location=DEVICE))
-main_model = main_model.to(DEVICE)
-main_model.eval()
-
-
-# === Predict Function ===
-def predict_and_print(image_path, topk=2):
+def segment_face(image_path, model):
     img = Image.open(image_path).convert('RGB')
-    img_tensor = predict_transform(img).unsqueeze(0).to(DEVICE)
+    img_resized = img.resize((512, 512), Image.BILINEAR)
+    tensor = to_tensor(img_resized).unsqueeze(0).to(DEVICE)
 
-    # === Main Season Prediction
     with torch.no_grad():
-        season_logits = main_model(img_tensor)
-        season_probs = torch.softmax(season_logits, dim=1).squeeze().cpu().numpy()
+        out = model(tensor)[0]
+        parsing = out.squeeze(0).cpu().numpy().argmax(0)
 
-    all_season_probs = {main_label_encoder.inverse_transform([i])[0]: float(season_probs[i])
-                        for i in range(len(season_probs))}
+    skin_mask = (parsing == 1).astype(np.uint8) * 255
+    skin_mask = cv2.merge([skin_mask]*3)
+    img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    result = cv2.bitwise_and(img_cv, skin_mask)
+    result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(result)
 
-    print("📊 All Season Probabilities:")
-    for label, prob in all_season_probs.items():
-        print(f"  - {label}: {prob:.4f}")
+from torchvision.models import convnext_large
+import torch.nn as nn
 
-    top_season_idx = heapq.nlargest(topk, range(len(season_probs)), season_probs.__getitem__)
-    top_seasons = [(main_label_encoder.inverse_transform([i])[0], float(season_probs[i]))
-                   for i in top_season_idx]
+def load_convnext_model(model_path, num_classes):
+    model = convnext_large(weights=None)  # No pretrained weights
+    model.classifier[2] = nn.Linear(model.classifier[2].in_features, num_classes)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.to(DEVICE)
+    model.eval()
+    return model
 
-    # === Subtone Predictions per Season
-    final_results = {}
-    for season, season_prob in top_seasons:
-        model_path = os.path.join(DATASET_DIR, f"convnext_subtone_{season}.pth")
-        if not os.path.exists(model_path):
-            print(f"⛔ Skipping {season} — model not found.")
-            continue
+# ==== Prediction Function ====
+def predict_top_k(image_pil, model_path, top_k=2, labels=None):
+    model = load_convnext_model(model_path, num_classes=len(labels))
+    model.eval()
 
-        subtone_df = main_df[main_df['season'] == season]
-        subtone_le = LabelEncoder()
-        subtone_le.fit(subtone_df['label'].apply(lambda x: x.split('_')[1]))
-        num_subtones = len(subtone_le.classes_)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
 
-        # Load subtone model
-        subtone_model = convnext_large(weights=None)
-        subtone_model.classifier[2] = nn.Linear(subtone_model.classifier[2].in_features, num_subtones)
-        subtone_model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-        subtone_model = subtone_model.to(DEVICE)
-        subtone_model.eval()
+    input_tensor = transform(image_pil).unsqueeze(0).to(DEVICE)
 
-        with torch.no_grad():
-            subtone_logits = subtone_model(img_tensor)
-            subtone_probs = torch.softmax(subtone_logits, dim=1).squeeze().cpu().numpy()
+    with torch.no_grad():
+        logits = model(input_tensor)
+        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
 
-        all_subtone_probs = {subtone_le.inverse_transform([i])[0]: float(subtone_probs[i])
-                             for i in range(len(subtone_probs))}
+    sorted_indices = np.argsort(probs)[::-1]
+    if labels is None:
+        labels = [f"Class {i}" for i in range(len(probs))]
 
-        print(f"\n📊 All Subtone Probabilities for {season}:")
-        for label, prob in all_subtone_probs.items():
-            print(f"  - {label}: {prob:.4f}")
+    print("Full Prediction Confidence:")
+    for i in range(len(labels)):
+        print(f"{labels[sorted_indices[i]]}: {probs[sorted_indices[i]]:.4f}")
 
-        top_subtone_idx = heapq.nlargest(topk, range(len(subtone_probs)), subtone_probs.__getitem__)
-        top_subtones = [(subtone_le.inverse_transform([i])[0], float(subtone_probs[i]))
-                        for i in top_subtone_idx]
+    top_preds = []
+    if labels == MAIN_SEASON_LABELS:
+        print("Top Predictions:")
+        for i in range(top_k):
+            label = labels[sorted_indices[i]]
+            prob = probs[sorted_indices[i]]
+            print(f"Top {i + 1}: {label} ({prob:.2%})")
+            top_preds.append((label, prob))
+    else:
+        for i in range(top_k):
+            label = labels[sorted_indices[i]]
+            prob = probs[sorted_indices[i]]
+            top_preds.append((label, prob))
+    print("-" * 50)
 
-        final_results[season] = top_subtones
+    return top_preds
 
-    # === Final Decision
-    print("\n✅ Final Top Predictions:")
-    for season, prob in top_seasons:
-        print(f"  🌸 {season.upper()} ({prob:.4f})")
-        if season in final_results:
-            for subtone, p in final_results[season]:
-                print(f"     ↳ {subtone} ({p:.4f})")
+# ==== Label Sets ====
+MAIN_SEASON_LABELS = ['spring', 'summer', 'autumn', 'winter']
 
+# ==== MODEL PATHS ====
+MODELS = {
+    "main_season": {
+        "path": os.path.join(MODEL_DIR, "convnext_season_large.pth"),
+        "labels": ['spring', 'summer', 'autumn', 'winter']
+    },
+    "subtone_spring": {
+        "path": os.path.join(MODEL_DIR, "convnext_subtone_spring.pth"),
+        "labels": ['bright', 'light', 'warm']
+    },
+    "subtone_summer": {
+        "path": os.path.join(MODEL_DIR, "convnext_subtone_summer.pth"),
+        "labels": ['cool', 'light', 'soft']
+    },
+    "subtone_autumn": {
+        "path": os.path.join(MODEL_DIR, "convnext_subtone_autumn.pth"),
+        "labels": ['deep', 'soft', 'warm']
+    },
+    "subtone_winter": {
+        "path": os.path.join(MODEL_DIR, "convnext_subtone_winter.pth"),
+        "labels": ['bright', 'cool', 'deep']
+    }
+}
+
+# ==== Main Execution ====
 if __name__ == "__main__":
-    predict_and_print("merge_dataset_cropped_segmented/autumn/deep/981.png", topk=2)
+    print("Segmenting input image...")
+    face_parser = load_face_segmenter()
+    segmented = segment_face(IMG_PATH, face_parser)
+
+    # Optional: Show segmented image
+    # segmented.show(title="Segmented Image")
+
+    print("Running predictions...\n")
+
+    all_results = {}
+    main_top2 = []
+
+    # Run all models
+    top_main_season = ""
+    subtone_results = {}
+
+    for name, config in MODELS.items():
+        print(f"MODEL: {name}")
+        top2 = predict_top_k(segmented, config["path"], top_k=2, labels=config["labels"])
+
+        if name == "main_season":
+            main_top2 = top2
+            top_main_season = top2[0][0]  # Get top-1 main season
+
+        if "subtone" in name:
+            subtone_results[name] = top2
+
+    # Final summary based on top-1 main season
+    top_main_season = main_top2[0][0]
+    subtone_key = f"subtone_{top_main_season}"
+
+    top_main_season = main_top2[0][0]
+    top_main_prob = main_top2[0][1]
+
+    print("\nFinal Prediction Results")
+    print(f"Main Season: {top_main_season} ({top_main_prob:.2%})")
+
+    matching_subtone_key = f"subtone_{top_main_season}"
+    if matching_subtone_key in subtone_results:
+        print("Top 2 Subtones:")
+        for i, (label, prob) in enumerate(subtone_results[matching_subtone_key], 1):
+            print(f"  {i}. {label} ({prob:.2%})")
