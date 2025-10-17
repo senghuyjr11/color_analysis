@@ -42,3 +42,4 @@ coloredlogs
 flatbuffers
 pyreadline3
 rembg
+tf-keras

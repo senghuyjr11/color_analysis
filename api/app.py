@@ -80,7 +80,7 @@ async def predict_skin_tone_endpoint(file: UploadFile = File(...)):
 
 
 # === Emotion Analysis ===
-emotion_model_path = "../color_tone/model/best_densenet121_rafdb.pth"
+emotion_model_path = "../models/best_densenet121_rafdb.pth"
 emotion_labels = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
 
 emotion_model = densenet121(weights=DenseNet121_Weights.DEFAULT)
