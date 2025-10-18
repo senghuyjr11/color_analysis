@@ -1,60 +1,49 @@
+# gemini_agent.py
 import os, json, hashlib
-from typing import Dict, Any
-
+from typing import Dict, Any, List
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# -------- Lazy client init (avoids import-time crashes) --------
-_client = None
-def _get_client() -> genai.Client:
-    global _client
-    if _client is not None:
-        return _client
-    load_dotenv()  # load .env at call-time
+_CLIENT = None
+
+def _client() -> genai.Client:
+    global _CLIENT
+    if _CLIENT: return _CLIENT
+    load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set. Put it in .env or OS env.")
-    _client = genai.Client(api_key=api_key)
-    return _client
+        raise RuntimeError("GEMINI_API_KEY not set")
+    _CLIENT = genai.Client(api_key=api_key)
+    return _CLIENT
 
-# -------- Deterministic prompt --------
-PROMPT = """
-You are a deterministic personal color and emotion analyst.
-Analyze the given face image and return a JSON strictly following the schema.
+# ----------------------------
+# Common settings
+# ----------------------------
+SEVEN = ["surprise","fear","disgust","happy","sad","angry","neutral"]
 
-Important:
-- Non-skin regions are masked or filled; IGNORE any black/gray/filled areas.
-- Base your season/subtype and palette ONLY on SKIN undertone cues.
-- Be consistent and do not randomize outputs.
+# ====== TONE (skin-only) ======
+_TONE_PROMPT = """
+You analyze SKIN TONE ONLY. Non-skin areas are masked/filled; ignore them completely.
+Return tone and a 5-color palette. Do NOT return any emotion fields.
 
-Tasks:
-1) Identify the most probable SEASON and SUBTYPE of personal color tone.
-2) Describe the EMOTION reflected by the overall image (expression + color mood)
-   from: [happy, calm, sad, energetic, neutral, serious, surprised].
-3) Provide concise REASONING (1–2 sentences) explaining both color and emotion.
-
-Return only JSON that matches the schema exactly.
-Use numeric confidences in the 0–1 range.
-Set "rgb_vector_15d" to null (server computes it locally).
+Fields:
+- season: one of ["spring","summer","autumn","winter"]
+- subtype: one of ["warm","cool","deep","bright","soft","light"]
+- confidence: number 0..1 (confidence in season)
+- season_confidences: object with keys spring, summer, autumn, winter (0..1; not necessarily normalized)
+- top_2_seasons: array of [season, score]
+- top_2_subtones: array of [subtype, score]
+- hex_palette: exactly 5 HEX strings (e.g. "#AABBCC")
+- reasoning: 1–2 sentences (why these tones)
 """
 
-# -------- Strict schema for JSON output --------
-SCHEMA = types.Schema(
+_TONE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
     properties={
-        "predicted_label": types.Schema(type=types.Type.STRING),
         "season": types.Schema(type=types.Type.STRING, enum=["spring","summer","autumn","winter"]),
         "subtype": types.Schema(type=types.Type.STRING, enum=["warm","cool","deep","bright","soft","light"]),
         "confidence": types.Schema(type=types.Type.NUMBER),
-        "top_2_subtones": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.ARRAY,
-                items=types.Schema(any_of=[types.Schema(type=types.Type.STRING), types.Schema(type=types.Type.NUMBER)]),
-                min_items=2, max_items=2
-            )
-        ),
         "season_confidences": types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -73,81 +62,68 @@ SCHEMA = types.Schema(
                 min_items=2, max_items=2
             )
         ),
+        "top_2_subtones": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.ARRAY,
+                items=types.Schema(any_of=[types.Schema(type=types.Type.STRING), types.Schema(type=types.Type.NUMBER)]),
+                min_items=2, max_items=2
+            )
+        ),
         "hex_palette": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING), min_items=5, max_items=5),
-        "rgb_vector_15d": types.Schema(any_of=[
-            types.Schema(type=types.Type.NULL),
-            types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.NUMBER), min_items=15, max_items=15),
-        ]),
-        "palette_image_path": types.Schema(type=types.Type.STRING),
         "reasoning": types.Schema(type=types.Type.STRING),
-        "emotion": types.Schema(type=types.Type.STRING, enum=["happy","calm","sad","energetic","neutral","serious","surprised"]),
-        "emotion_confidence": types.Schema(type=types.Type.NUMBER),
     },
-    required=[
-        "predicted_label","season","subtype","confidence",
-        "top_2_subtones","season_confidences","top_2_seasons",
-        "hex_palette","rgb_vector_15d","palette_image_path",
-        "reasoning","emotion","emotion_confidence"
-    ],
+    required=["season","subtype","confidence","season_confidences","top_2_seasons","top_2_subtones","hex_palette","reasoning"]
 )
 
-_CACHE_FILE = "gemini_cache.json"
-def _load_cache() -> Dict[str, Any]:
-    if not os.path.exists(_CACHE_FILE):
-        return {}
-    try:
-        with open(_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_cache(cache: Dict[str, Any]) -> None:
-    try:
-        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2)
-    except Exception:
-        pass
-
-def analyze_with_gemini(segmented_face_bytes: bytes, model_name: str = "gemini-2.5-flash") -> dict:
-    """Deterministic Gemini call (temperature=0) with schema + caching."""
-    # cache by bytes of the segmented image
-    key = hashlib.md5(segmented_face_bytes).hexdigest()
-    cache = _load_cache()
-    if key in cache:
-        return cache[key]
-
-    client = _get_client()
-    image_part = types.Part.from_bytes(data=segmented_face_bytes, mime_type="image/jpeg")
-
-    resp = client.models.generate_content(
+def analyze_tone_skin_only(segmented_jpeg_bytes: bytes, model_name: str = "gemini-2.5-flash") -> dict:
+    c = _client()
+    img = types.Part.from_bytes(data=segmented_jpeg_bytes, mime_type="image/jpeg")
+    resp = c.models.generate_content(
         model=model_name,
-        contents=[image_part, PROMPT],
-        config={
-            "temperature": 0.0,  # deterministic
-            "response_mime_type": "application/json",
-            "response_schema": SCHEMA
-        }
+        contents=[img, _TONE_PROMPT],
+        config={"temperature": 0.0, "response_mime_type": "application/json", "response_schema": _TONE_SCHEMA},
     )
 
-    raw = getattr(resp, "text", "") or ""
-    if not raw:
-        # attempt salvage (rare)
-        try:
-            cand = resp.candidates[0]
-            parts = getattr(cand, "content", {}).parts if hasattr(cand, "content") else []
-            if parts and hasattr(parts[0], "text"):
-                raw = parts[0].text
-        except Exception:
-            pass
-
-    if not raw:
-        raise RuntimeError("Gemini returned empty response or was safety-blocked.")
-
+    text = getattr(resp, "text", "") or ""
+    if not text:
+        raise RuntimeError("Empty tone response from Gemini")
     try:
-        data = json.loads(raw)
+        return json.loads(text)
     except json.JSONDecodeError:
-        raise RuntimeError(f"Gemini did not return valid JSON.\nRaw:\n{raw}")
+        raise RuntimeError(f"Non-JSON tone response: {text[:200]}")
 
-    cache[key] = data
-    _save_cache(cache)
-    return data
+# ====== EMOTION (face crop) ======
+_EMO_PROMPT = f"""
+You classify FACIAL EXPRESSION ONLY from an unmasked face crop.
+Use exactly these labels (no others): {SEVEN}.
+Return:
+- label: one of {SEVEN}
+- confidence: 0..1
+Keep temperature 0 behavior; do not randomize.
+"""
+
+_EMO_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "label": types.Schema(type=types.Type.STRING, enum=SEVEN),
+        "confidence": types.Schema(type=types.Type.NUMBER),
+    },
+    required=["label","confidence"]
+)
+
+def infer_expression_facecrop(face_jpeg_bytes: bytes, model_name: str = "gemini-2.5-flash") -> dict:
+    c = _client()
+    img = types.Part.from_bytes(face_jpeg_bytes, mime_type="image/jpeg")
+    resp = c.models.generate_content(
+        model=model_name,
+        contents=[img, _EMO_PROMPT],
+        config={"temperature": 0.0, "response_mime_type": "application/json", "response_schema": _EMO_SCHEMA},
+    )
+    text = getattr(resp, "text", "") or ""
+    if not text:
+        raise RuntimeError("Empty emotion response from Gemini")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Non-JSON emotion response: {text[:200]}")

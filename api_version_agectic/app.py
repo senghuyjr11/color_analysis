@@ -1,4 +1,5 @@
-# app.py
+from helper import make_run_dir, save_pil, save_side_by_side, write_json
+from helper import fix_orientation_to_portrait
 import io
 import numpy as np
 import torch
@@ -26,12 +27,16 @@ from predictor import predict_skin_tone
 client_initialized = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Emotion thresholds (Option A)
+T_HIGH_LOCAL = 0.80   # trust local when >= this
+T_LOW_LOCAL  = 0.55   # call Gemini fallback when < this
+T_GEM_FINAL  = 0.75   # trust Gemini fallback when >= this
+
 # ==============================
 # FASTAPI APP
 # ==============================
 app = FastAPI(title="Unified Color Tone + Emotion API")
 
-# CORS (frontend access)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,8 +48,14 @@ app.add_middleware(
 # ==============================
 # LOAD LOCAL FACIAL-EMOTION MODEL ONCE
 # ==============================
-# Use ./models if models/ sits next to app.py. Change if your tree differs.
-emotion_model_path = "../models/best_densenet121_rafdb.pth"
+# Try ./models first, then ../models (robust to layout)
+_model_candidates = [
+    "./models/best_densenet121_rafdb.pth",
+    "../models/best_densenet121_rafdb.pth",
+]
+import os
+emotion_model_path = next((p for p in _model_candidates if os.path.exists(p)), _model_candidates[0])
+
 emotion_labels = ["surprise", "fear", "disgust", "happy", "sad", "angry", "neutral"]
 
 emotion_model = densenet121(weights=DenseNet121_Weights.DEFAULT)
@@ -79,81 +90,71 @@ def root():
 # ==============================
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    """
-    Single endpoint:
-      - face check (soft gate)
-      - segmentation + Gemini (season/subtype/palette/reasoning + color-based emotion)
-      - local DenseNet facial expression (on cropped face, NOT masked)
-      - palette vector + saved palette image
-      - normalized season confidences
-      - achromatic guard with seasonal fallback
-      - fused final emotion + human-readable explanation
-    """
     if not client_initialized:
         return {"error": "Call GET / first to initialize."}
 
     try:
-        # ---- read image
+        # ---- set up run dir (use original filename stem for readability)
+        stem = os.path.splitext(file.filename or "image")[0]
+        run_dir = make_run_dir(base_dir="runs", stem=stem)
+
+        # ---- read & save original
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        # ---- face check (soft gate)
+
+        image = fix_orientation_to_portrait(image)
+        save_pil(image, os.path.join(run_dir, "01_original.jpg"))
+
+        # ---- face crop for emotion; save it
         warnings = []
         if not is_human_face(image):
             cropped = crop_face_for_emotion(image)
             if not is_human_face(cropped):
                 warnings.append("Face detector was uncertain; proceeded with best effort.")
-                face_for_emotion = cropped  # still use best crop
+                face_for_emotion = cropped
             else:
                 face_for_emotion = cropped
         else:
             face_for_emotion = crop_face_for_emotion(image)
+        save_pil(face_for_emotion, os.path.join(run_dir, "01a_face_crop.jpg"))
 
-        # ---- segmentation + Gemini (via predictor)
+        # ---- Tone via predictor (now returns intermediates too)
         (
-            main_season,
-            confidence,
-            subtones,
-            season_confidences,
-            top_2_seasons,
-            gemini_out,
-        ) = predict_skin_tone(image)
+            main_season, confidence, subtones, season_confidences, top_2_seasons, gemini_out,
+            seg_filled_pil, stabilized_pil, skin_mask
+        ) = predict_skin_tone(image, run_dir=run_dir)
 
-        # --- normalize season_confidences for clarity ---
+        # ---- normalize tone confidences
         if season_confidences:
             total = sum(season_confidences.values()) or 1.0
             season_confidences = {k: float(v) / total for k, v in season_confidences.items()}
-
-        # recompute top_2_seasons from normalized values
         if season_confidences:
             _sorted = sorted(season_confidences.items(), key=lambda kv: kv[1], reverse=True)
             top_2_seasons = [(k, v) for k, v in _sorted[:2]]
 
         predicted_label = f"{main_season.capitalize()}_{subtones[0][0].capitalize()}"
 
-        # ---- palette (prefer Gemini, fallback to static map)
+        # ---- palette choose + save palette image (you already do)
         palette_hex = gemini_out.get("hex_palette") if isinstance(gemini_out, dict) else None
         if not palette_hex:
             palette_hex = season_tone_palettes.get(predicted_label, [])
-
-        # --- achromatic guard: if Gemini returns mostly gray/black, fallback to canonical ---
         if is_achromatic(palette_hex):
             fallback_key = f"{main_season.capitalize()}_{subtones[0][0].capitalize()}"
             palette_hex = season_tone_palettes.get(fallback_key, palette_hex)
 
-        # ---- palette vector + saved preview image
         palette_vec = palette_to_vector(palette_hex)
         palette_path = save_palette_image(palette_hex, predicted_label, file.filename)
+        # also copy palette into run_dir with a clean name
+        pal_name = f"04_palette_{predicted_label}.png"
+        pal_target = os.path.join(run_dir, pal_name)
+        Image.open(palette_path).save(pal_target)
+        palette_path = pal_target  # prefer the run_dir path
 
-        # ---- color mood (heuristic from palette)
+        # ---- color mood
         mood = estimate_emotion_from_palette(hex_palette=palette_hex)
 
-        # ---- Gemini color-based emotion
-        reasoning = gemini_out.get("reasoning") if isinstance(gemini_out, dict) else None
-        gem_emotion = gemini_out.get("emotion") if isinstance(gemini_out, dict) else None
-        gem_emotion_conf = gemini_out.get("emotion_confidence") if isinstance(gemini_out, dict) else None
-
-        # ---- local facial-expression emotion (DenseNet ON CROPPED FACE)
+        # ---- local emotion
         input_tensor = emotion_transform(face_for_emotion).unsqueeze(0).to(device)
         with torch.no_grad():
             logits = emotion_model(input_tensor)
@@ -162,32 +163,48 @@ async def analyze(file: UploadFile = File(...)):
         expr_emotion = emotion_labels[expr_idx]
         expr_conf = float(probs[expr_idx])
 
-        # ---- fusion: prefer strong signals; otherwise combine expression + color vibe
+        # ---- optional Gemini fallback (unchanged)
+        from io import BytesIO
+        face_buf = BytesIO()
+        face_for_emotion.save(face_buf, format="JPEG", quality=85)
+        face_bytes = face_buf.getvalue()
+
+        emotion_source = "local"
+        fused = expr_emotion
         if expr_conf >= 0.80:
             fused = expr_emotion
-        elif gem_emotion and (gem_emotion_conf or 0) >= 0.80:
-            fused = gem_emotion
+            emotion_source = "local"
         else:
-            fused = f"{expr_emotion} under {mood['color_mood'].lower()} tone"
+            if expr_conf < 0.55:
+                try:
+                    from gemini_agent import infer_expression_facecrop
+                    gemo = infer_expression_facecrop(face_bytes)
+                    gem_label = gemo.get("label"); gem_conf = float(gemo.get("confidence", 0.0))
+                except Exception:
+                    gem_label, gem_conf = None, 0.0
+                if gem_label and gem_conf >= 0.75:
+                    fused = gem_label; emotion_source = "gemini_fallback"
 
-        # ---- short human explanation
         explanation = (
-            f"Facial expression looks {expr_emotion} (conf {expr_conf:.2f}). "
-            f"Palette feels {mood['color_mood'].lower()} "
-            f"→ overall reads {fused}."
+            f"Facial expression: {expr_emotion} (conf {expr_conf:.2f}). "
+            f"Palette mood: {mood['color_mood'].lower()}. "
+            f"Final emotion: {fused} (source: {emotion_source})."
+        )
+        if expr_conf < 0.40: warnings.append("Facial emotion is low-confidence.")
+        if (mood.get('confidence') or 0) < 0.30: warnings.append("Color mood signal is weak or achromatic.")
+        if is_achromatic(palette_hex): warnings.append("Palette was achromatic; used seasonal fallback.")
+
+        # ---- save a side-by-side collage
+        compare_path = os.path.join(run_dir, "05_comparison_grid.jpg")
+        save_side_by_side(
+            images=[image, face_for_emotion, seg_filled_pil, stabilized_pil],
+            labels=["Original", "Face Crop", "Segmented (Filled)", "Stabilized (WB+Exposure)"],
+            path=compare_path,
+            cols=2
         )
 
-        # ---- surface uncertainty as warnings (append, don't overwrite)
-        if expr_conf < 0.40:
-            warnings.append("Facial emotion is low-confidence.")
-        if (mood.get('confidence') or 0) < 0.30:
-            warnings.append("Color mood signal is weak or achromatic.")
-        if is_achromatic(palette_hex):
-            warnings.append("Palette was achromatic; used seasonal fallback.")
-
-        # ---- response
-        return {
-            # Tone & subtone
+        # ---- write a summary JSON
+        summary = {
             "tone": {
                 "season": main_season,
                 "subtype": subtones[0][0],
@@ -195,32 +212,41 @@ async def analyze(file: UploadFile = File(...)):
                 "season_confidences": season_confidences,
                 "top_2_seasons": top_2_seasons,
                 "top_2_subtones": subtones,
-                "predicted_label": f"{main_season.capitalize()}_{subtones[0][0].capitalize()}",
+                "predicted_label": predicted_label,
             },
-
-            # Palette & vector
             "palette": {
                 "hex": palette_hex,
                 "rgb_vector_15d": palette_vec.tolist(),
                 "image_path": palette_path,
             },
-
-            # Emotions (separated for clarity)
             "emotion": {
                 "facial_expression": expr_emotion,
                 "facial_expression_confidence": expr_conf,
                 "color_vibe": mood["color_mood"],
                 "color_vibe_confidence": mood["confidence"],
-                "gemini_color_emotion": gem_emotion,
-                "gemini_color_emotion_confidence": gem_emotion_conf,
                 "final_interpretation": fused,
+                "emotion_source": emotion_source,
             },
-
-            # Reasoning & UX helpers
-            "reasoning": reasoning,
+            "reasoning": (gemini_out.get("reasoning") if isinstance(gemini_out, dict) else None),
             "explanation": explanation,
             "warnings": warnings,
+            "artifacts": {
+                "original": os.path.join(run_dir, "01_original.jpg"),
+                "face_crop": os.path.join(run_dir, "01a_face_crop.jpg"),
+                "segmented_filled": os.path.join(run_dir, "02_segmented_filled.jpg"),
+                "skin_mask": os.path.join(run_dir, "02a_skin_mask.png"),
+                "stabilized_for_gemini": os.path.join(run_dir, "03_stabilized_for_gemini.jpg"),
+                "palette_image": palette_path,
+                "comparison_grid": compare_path,
+                "run_dir": run_dir
+            }
         }
+        summary_path = os.path.join(run_dir, "result_summary.json")
+        write_json(summary, summary_path)
+
+        # ---- normal API response + debug paths
+        return summary
 
     except Exception as e:
         return {"error": str(e)}
+

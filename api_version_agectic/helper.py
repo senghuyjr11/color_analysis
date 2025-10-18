@@ -1,18 +1,13 @@
 import os
 
 import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
-from deepface import DeepFace
-
-
 # ====================================================
 # FACE DETECTION
 # ====================================================
 # helper.py
 from PIL import Image
 from deepface import DeepFace
-import numpy as np
+
 
 def is_human_face(image: Image.Image, min_conf=0.5) -> bool:
     """
@@ -166,3 +161,177 @@ def is_achromatic(hex_palette, min_gray=3, sat_thresh=0.10):
         if s < sat_thresh:
             cnt += 1
     return cnt >= min_gray
+
+import numpy as np
+import cv2
+from PIL import Image
+
+def _to_uint8(img):
+    img = np.clip(img, 0, 255)
+    return img.astype(np.uint8)
+
+def _ensure_rgb(arr):
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    return arr
+
+def build_skin_midtone_mask(rgb_uint8: np.ndarray, skin_mask_uint8: np.ndarray,
+                            v_range=(0.15, 0.85), s_min=0.10) -> np.ndarray:
+    """
+    Keep only skin pixels that are in midtones and not extremely desaturated.
+    Returns uint8 mask {0,255} of same HxW.
+    """
+    assert rgb_uint8.ndim == 3 and rgb_uint8.shape[2] == 3
+    H, W, _ = rgb_uint8.shape
+
+    hsv = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2HSV).astype(np.float32)
+    Hc, Sc, Vc = hsv[..., 0] / 179.0, hsv[..., 1] / 255.0, hsv[..., 2] / 255.0
+
+    skin = (skin_mask_uint8 > 0)
+    mid = (Vc >= v_range[0]) & (Vc <= v_range[1])
+    sat = (Sc >= s_min)
+
+    keep = (skin & mid & sat).astype(np.uint8) * 255
+    return keep
+
+def white_balance_gray_world_on_skin(rgb_uint8: np.ndarray, skin_mid_mask_uint8: np.ndarray) -> np.ndarray:
+    """
+    Gray-world white balance computed only on skin midtone region.
+    Scales R,G,B so their means are equal in that region.
+    """
+    rgb_uint8 = _ensure_rgb(rgb_uint8)
+    mask = (skin_mid_mask_uint8 > 0)
+
+    if mask.sum() < 50:   # too few pixels; skip
+        return rgb_uint8
+
+    # compute per-channel means in skin midtones
+    means = rgb_uint8[mask].reshape(-1, 3).mean(axis=0)  # [R,G,B] in uint8 space
+    ref = means.mean() + 1e-6
+    gains = ref / (means + 1e-6)                        # 3 gains
+
+    balanced = rgb_uint8.astype(np.float32)
+    balanced[..., 0] *= gains[0]
+    balanced[..., 1] *= gains[1]
+    balanced[..., 2] *= gains[2]
+    balanced = _to_uint8(balanced)
+    return balanced
+
+def normalize_exposure_on_skin(rgb_uint8: np.ndarray, skin_mid_mask_uint8: np.ndarray,
+                               target_V=0.55) -> np.ndarray:
+    """
+    Adjust global exposure to bring the skin midtone value near target_V (0..1).
+    Works in HSV; applies a smooth gamma to the V channel.
+    """
+    rgb_uint8 = _ensure_rgb(rgb_uint8)
+    hsv = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2HSV).astype(np.float32)
+    V = hsv[..., 2] / 255.0
+
+    mask = (skin_mid_mask_uint8 > 0)
+    if mask.sum() < 50:
+        return rgb_uint8
+
+    current = float(V[mask].mean())
+    current = np.clip(current, 1e-3, 0.999)
+
+    # gamma to map current -> target: V_out = V_in^(gamma)
+    # solve gamma = log(target)/log(current)
+    gamma = np.log(max(target_V, 1e-3)) / np.log(current)
+    gamma = float(np.clip(gamma, 0.5, 2.0))  # avoid extreme shifts
+
+    V_out = np.power(V, gamma)
+    hsv[..., 2] = np.clip(V_out * 255.0, 0, 255)
+
+    out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    return out
+
+def stabilize_skin_only_rgb(rgb_uint8: np.ndarray, skin_mask_uint8: np.ndarray,
+                            v_range=(0.15, 0.85), s_min=0.10, target_V=0.55) -> np.ndarray:
+    """
+    Full pipeline:
+      1) build midtone mask on skin
+      2) gray-world white balance on skin midtones
+      3) exposure normalization on skin midtones
+    Returns stabilized RGB uint8 image.
+    """
+    rgb_uint8 = _ensure_rgb(rgb_uint8)
+    skin_mask_uint8 = (skin_mask_uint8 > 0).astype(np.uint8) * 255
+
+    mid = build_skin_midtone_mask(rgb_uint8, skin_mask_uint8, v_range=v_range, s_min=s_min)
+    step1 = white_balance_gray_world_on_skin(rgb_uint8, mid)
+    step2 = normalize_exposure_on_skin(step1, mid, target_V=target_V)
+    return step2
+
+def pil_from_rgb(arr_uint8: np.ndarray) -> Image.Image:
+    return Image.fromarray(_ensure_rgb(arr_uint8))
+
+import os, json, uuid, datetime
+from typing import List, Tuple
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+
+def make_run_dir(base_dir: str = "runs", stem: str | None = None) -> str:
+    """
+    Create a unique folder for this request, e.g. runs/2025-10-18_14-03-07_4f2a/
+    Return absolute path.
+    """
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    uid = uuid.uuid4().hex[:4]
+    name = stem or "request"
+    run_dir = os.path.abspath(os.path.join(base_dir, f"{ts}_{uid}_{name}"))
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+def save_pil(img: Image.Image, path: str) -> str:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    img.save(path)
+    return path
+
+def save_np_mask(mask_uint8: np.ndarray, path: str) -> str:
+    """
+    Save a single-channel uint8 mask as PNG.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    Image.fromarray(mask_uint8).save(path)
+    return path
+
+def save_side_by_side(images: List[Image.Image], labels: List[str], path: str, cols: int = 2):
+    """
+    Save a comparison grid (no need to display). Uses matplotlib.
+    """
+    assert len(images) == len(labels)
+    n = len(images)
+    rows = (n + cols - 1) // cols
+
+    fig = plt.figure(figsize=(cols * 4, rows * 4))
+    for i, (im, title) in enumerate(zip(images, labels), 1):
+        ax = fig.add_subplot(rows, cols, i)
+        ax.imshow(im)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    plt.savefig(path, dpi=150, bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+
+def write_json(data: dict, path: str) -> str:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+from PIL import Image, ImageOps
+
+def fix_orientation_to_portrait(img: Image.Image) -> Image.Image:
+    """
+    1) Apply EXIF orientation (handles phone-rotated photos).
+    2) If the image is still landscape (width > height), rotate 90° CCW
+       to make it portrait. (Simple, deterministic rule.)
+    """
+    img = ImageOps.exif_transpose(img)  # respects EXIF Orientation tag
+    if img.width > img.height:
+        img = img.rotate(90, expand=True)  # CCW to portrait
+    return img
