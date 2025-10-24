@@ -55,7 +55,7 @@ async def analyze_full_endpoint(file: UploadFile = File(...)):
     try:
         # ---- set up run dir (use original filename stem for readability)
         stem = os.path.splitext(file.filename or "image")[0]
-        run_dir = make_run_dir(base_dir="runs_combined", stem=stem)  # New run directory
+        run_dir = make_run_dir(base_dir="outputs", stem=stem)
 
         # ---- read & save original
         image_bytes = await file.read()
