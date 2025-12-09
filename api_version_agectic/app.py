@@ -19,7 +19,7 @@ from helper import (
     crop_face_for_emotion,
     is_achromatic,
 )
-from predictor import predict_skin_tone
+from predictor import predict_skin_tone, _get_face_segmenter  # Import BiSeNet loader
 
 # ==============================
 # CONFIG
@@ -28,9 +28,9 @@ client_initialized = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Emotion thresholds (Option A)
-T_HIGH_LOCAL = 0.80   # trust local when >= this
-T_LOW_LOCAL  = 0.55   # call Gemini fallback when < this
-T_GEM_FINAL  = 0.75   # trust Gemini fallback when >= this
+T_HIGH_LOCAL = 0.80  # trust local when >= this
+T_LOW_LOCAL = 0.55  # call Gemini fallback when < this
+T_GEM_FINAL = 0.75  # trust Gemini fallback when >= this
 
 # ==============================
 # FASTAPI APP
@@ -54,18 +54,32 @@ _model_candidates = [
     "../models/best_densenet121_rafdb.pth",
 ]
 import os
+
 emotion_model_path = next((p for p in _model_candidates if os.path.exists(p)), _model_candidates[0])
 
 emotion_labels = ["surprise", "fear", "disgust", "happy", "sad", "angry", "neutral"]
+
+# --- DenseNet121 Confirmation Print ---
+if not os.path.exists(emotion_model_path):
+    print(f"❌ ERROR: Emotion model weights not found at: {os.path.abspath(emotion_model_path)}")
+else:
+    print(f"💡 Attempting to load Emotion Model from: {os.path.basename(emotion_model_path)}")
+# --------------------------------------
 
 emotion_model = densenet121(weights=DenseNet121_Weights.DEFAULT)
 emotion_model.classifier = nn.Sequential(
     nn.Dropout(0.3),
     nn.Linear(emotion_model.classifier.in_features, 7),
 )
-emotion_model.load_state_dict(torch.load(emotion_model_path, map_location=device))
-emotion_model.eval()
-emotion_model = emotion_model.to(device)
+
+try:
+    emotion_model.load_state_dict(torch.load(emotion_model_path, map_location=device))
+    emotion_model.eval()
+    emotion_model = emotion_model.to(device)
+    print("✅ Local Facial-Emotion Model (DenseNet121) loaded successfully.")
+except Exception as e:
+    print(f"❌ FATAL ERROR loading Emotion Model: {e}")
+    emotion_model = None
 
 emotion_transform = transforms.Compose(
     [
@@ -76,6 +90,20 @@ emotion_transform = transforms.Compose(
     ]
 )
 
+
+# ==============================
+# FASTAPI STARTUP EVENT
+# ==============================
+@app.on_event("startup")
+def startup_event():
+    # Trigger BiSeNet model load only (DenseNet is loaded module-wide)
+    _get_face_segmenter()
+
+    print("\n\n********************************************************")
+    print("🚀 UVICORN STARTUP: ALL ACTIVE MODELS INITIALIZED SUCCESSFULLY")
+    print("********************************************************\n")
+
+
 # ==============================
 # ROOT
 # ==============================
@@ -84,6 +112,7 @@ def root():
     global client_initialized
     client_initialized = True
     return {"message": "Ready."}
+
 
 # ==============================
 # ONE ENDPOINT TO DO IT ALL
@@ -102,7 +131,6 @@ async def analyze(file: UploadFile = File(...)):
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-
         image = fix_orientation_to_portrait(image)
         save_pil(image, os.path.join(run_dir, "01_original.jpg"))
 
@@ -119,7 +147,7 @@ async def analyze(file: UploadFile = File(...)):
             face_for_emotion = crop_face_for_emotion(image)
         save_pil(face_for_emotion, os.path.join(run_dir, "01a_face_crop.jpg"))
 
-        # ---- Tone via predictor (now returns intermediates too)
+        # ---- Tone via predictor (now includes local/Gemini fallback)
         (
             main_season, confidence, subtones, season_confidences, top_2_seasons, gemini_out,
             seg_filled_pil, stabilized_pil, skin_mask
@@ -163,7 +191,9 @@ async def analyze(file: UploadFile = File(...)):
         expr_emotion = emotion_labels[expr_idx]
         expr_conf = float(probs[expr_idx])
 
-        # ---- optional Gemini fallback (unchanged)
+        print(f"💡 Emotion: Local model result {expr_emotion} (Conf: {expr_conf:.2f})")
+
+        # ---- optional Gemini fallback (FUSION)
         from io import BytesIO
         face_buf = BytesIO()
         face_for_emotion.save(face_buf, format="JPEG", quality=85)
@@ -171,19 +201,36 @@ async def analyze(file: UploadFile = File(...)):
 
         emotion_source = "local"
         fused = expr_emotion
-        if expr_conf >= 0.80:
+
+        # Local-first fusion logic
+        if expr_conf >= T_HIGH_LOCAL:
             fused = expr_emotion
             emotion_source = "local"
         else:
-            if expr_conf < 0.55:
+            if expr_conf < T_LOW_LOCAL:
+                # Fallback to Gemini for better result
+                print(f"⚠️ Emotion: Local confidence is low ({expr_conf:.2f}), falling back to Gemini API...")
                 try:
                     from gemini_agent import infer_expression_facecrop
                     gemo = infer_expression_facecrop(face_bytes)
-                    gem_label = gemo.get("label"); gem_conf = float(gemo.get("confidence", 0.0))
+                    gem_label = gemo.get("label");
+                    gem_conf = float(gemo.get("confidence", 0.0))
                 except Exception:
                     gem_label, gem_conf = None, 0.0
-                if gem_label and gem_conf >= 0.75:
-                    fused = gem_label; emotion_source = "gemini_fallback"
+
+                if gem_label and gem_conf >= T_GEM_FINAL:
+                    fused = gem_label
+                    emotion_source = "gemini_fallback"
+                    print(f"✅ Emotion: Fused with Gemini result {gem_label} (Conf: {gem_conf:.2f})")
+                else:
+                    # If Gemini fallback is also low confidence, stick to the original local model result
+                    fused = expr_emotion
+                    emotion_source = "local_low_conf"
+                    print(f"⚠️ Emotion: Gemini fallback also low/failed. Using original local result.")
+            else:
+                # Confidence is between T_LOW_LOCAL and T_HIGH_LOCAL, trust local result
+                fused = expr_emotion
+                emotion_source = "local_med_conf"
 
         explanation = (
             f"Facial expression: {expr_emotion} (conf {expr_conf:.2f}). "
@@ -248,5 +295,6 @@ async def analyze(file: UploadFile = File(...)):
         return summary
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {"error": str(e)}
-

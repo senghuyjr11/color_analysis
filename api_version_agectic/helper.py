@@ -247,21 +247,36 @@ def normalize_exposure_on_skin(rgb_uint8: np.ndarray, skin_mid_mask_uint8: np.nd
     out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
     return out
 
+
 def stabilize_skin_only_rgb(rgb_uint8: np.ndarray, skin_mask_uint8: np.ndarray,
-                            v_range=(0.15, 0.85), s_min=0.10, target_V=0.55) -> np.ndarray:
+                            v_range=(0.15, 0.85), s_min=0.10, target_V=0.55,
+                            blend_alpha: float = 1.0) -> np.ndarray:  # <-- ADD blend_alpha
     """
     Full pipeline:
       1) build midtone mask on skin
       2) gray-world white balance on skin midtones
       3) exposure normalization on skin midtones
+      4) Blend with original image using blend_alpha (1.0 = full effect, 0.0 = no effect)
     Returns stabilized RGB uint8 image.
     """
     rgb_uint8 = _ensure_rgb(rgb_uint8)
     skin_mask_uint8 = (skin_mask_uint8 > 0).astype(np.uint8) * 255
+    original_float = rgb_uint8.astype(np.float32)
 
     mid = build_skin_midtone_mask(rgb_uint8, skin_mask_uint8, v_range=v_range, s_min=s_min)
     step1 = white_balance_gray_world_on_skin(rgb_uint8, mid)
     step2 = normalize_exposure_on_skin(step1, mid, target_V=target_V)
+
+    # ----------------------------------------------------
+    # NEW: Blending logic (float math is safer for blending)
+    # ----------------------------------------------------
+    if 0.0 <= blend_alpha < 1.0:
+        stabilized_float = step2.astype(np.float32)
+        # Final = (1 - alpha) * Original + alpha * Stabilized
+        final_float = (1.0 - blend_alpha) * original_float + blend_alpha * stabilized_float
+        return _to_uint8(final_float)
+
+    # If alpha is 1.0 (default), return full stabilization
     return step2
 
 def pil_from_rgb(arr_uint8: np.ndarray) -> Image.Image:

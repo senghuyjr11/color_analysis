@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 from PIL import Image
+from typing import Tuple, Dict, Any, List
 
 from helper import stabilize_skin_only_rgb, pil_from_rgb
 
@@ -19,8 +20,9 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # =========================
-# Face parsing import & paths (as requested)
+# Face parsing import & paths
 # =========================
+# NOTE: This line assumes your face_parsing directory is a sibling of the current directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from face_parsing.model import BiSeNet  # noqa: E402
 
@@ -33,6 +35,12 @@ WEIGHTS = os.path.join(PROJECT_ROOT, "..", "face_parsing", "res", "cp", "79999_i
 # ---------------- Gemini tone-only API ----------------
 from gemini_agent import analyze_tone_skin_only  # assumes gemini_agent.py is importable
 
+# =========================
+# CONFIGURATION
+# =========================
+# Threshold for local tone model confidence before falling back to Gemini
+T_TONE_FALLBACK_CONF = 0.55
+
 # segmentation transform
 to_tensor = T.Compose([
     T.Resize((512, 512)),
@@ -42,21 +50,32 @@ to_tensor = T.Compose([
 
 # --------- load face segmenter once (global) ----------
 _FACE_SEGMENTER = None
+
+
 def _get_face_segmenter():
     global _FACE_SEGMENTER
     if _FACE_SEGMENTER is None:
         if not os.path.exists(WEIGHTS):
+            print(f"❌ ERROR: BiSeNet weights not found at: {os.path.abspath(WEIGHTS)}")
             raise FileNotFoundError(f"BiSeNet weights not found: {os.path.abspath(WEIGHTS)}")
+
+        print("💡 Attempting to load BiSeNet (Face Parsing) model...")
+
         model = BiSeNet(n_classes=19)
         model.to(DEVICE)
         model.load_state_dict(torch.load(os.path.abspath(WEIGHTS), map_location=DEVICE))
         model.eval()
         _FACE_SEGMENTER = model
+
+        print("✅ BiSeNet (Face Parsing) model loaded successfully.")
+
     return _FACE_SEGMENTER
+
 
 def _morph_close(mask, k=9, iters=1):
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker, iterations=iters)
+
 
 def _ellipse_fallback_mask(image_pil: Image.Image) -> np.ndarray:
     """If parsing fails, build a soft elliptical mask from the detected face box."""
@@ -68,6 +87,7 @@ def _ellipse_fallback_mask(image_pil: Image.Image) -> np.ndarray:
     H, W = rgb.shape[:2]
     dets = []
     try:
+        # Use a reliable detector like retinaface for robust detection
         dets = DeepFace.extract_faces(rgb, enforce_detection=False, detector_backend="retinaface")
     except Exception:
         pass
@@ -78,8 +98,10 @@ def _ellipse_fallback_mask(image_pil: Image.Image) -> np.ndarray:
 
     fa = dets[0].get("facial_area") or {}
     x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
-    x = max(0, x - int(0.08 * w)); y = max(0, y - int(0.08 * h))
-    w = int(w * 1.16); h = int(h * 1.12)
+    x = max(0, x - int(0.08 * w));
+    y = max(0, y - int(0.08 * h))
+    w = int(w * 1.16);
+    h = int(h * 1.12)
     x2, y2 = min(W, x + w), min(H, y + h)
     if x2 <= x or y2 <= y:
         return mask
@@ -91,15 +113,11 @@ def _ellipse_fallback_mask(image_pil: Image.Image) -> np.ndarray:
     cv2.ellipse(ellipse, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
     return ellipse
 
+
 def segment_face(image_pil: Image.Image):
     """
-    Robust skin mask:
-      - BiSeNet parsing
-      - use labels {1:skin, 14:neck}  (CelebAMask-HQ)
-      - morphology to fill holes
-      - sanity check on area; fallback to ellipse mask from face box if needed
-    Returns:
-      filled_rgb_pil, skin_mask_uint8
+    Robust skin mask using BiSeNet parsing.
+    Returns: filled_rgb_pil, skin_mask_uint8
     """
     image_pil = fix_orientation_to_portrait(image_pil)
     model = _get_face_segmenter()
@@ -113,7 +131,7 @@ def segment_face(image_pil: Image.Image):
         out = model(tensor)[0]
         parsing = out.squeeze(0).cpu().numpy().argmax(0)  # 512x512
 
-    # 2) skin classes: skin(1) + neck(14)  (broader, more stable)
+    # 2) skin classes: skin(1) + neck(14)
     skin_512 = np.isin(parsing, [1, 14]).astype(np.uint8) * 255
 
     # 3) upsample to original and clean
@@ -143,30 +161,81 @@ def segment_face(image_pil: Image.Image):
     return Image.fromarray(filled_rgb), skin_mask
 
 
+# ==================================
+# CONCEPTUAL LOCAL TONE PREDICTION
+# ==================================
+def predict_tone_local(stabilized_pil: Image.Image) -> Tuple[str, float, List[Tuple[str, float]]]:
+    """
+    *** REPLACE WITH YOUR ACTUAL LOCAL MODEL INFERENCE CODE (e.g., ConvNeXt) ***
+    Simulated local prediction for demonstration.
+    Returns: (predicted_season, confidence, top_2_subtones)
+    """
+    # For demonstration: high confidence 70% of the time, low otherwise
+    if random.random() < 0.7:
+        season = random.choice(["autumn", "winter"])
+        conf = random.uniform(0.70, 0.90)
+        subtype = "deep" if season == "winter" else "warm"
+    else:
+        season = random.choice(["spring", "summer"])
+        conf = random.uniform(0.30, 0.50)
+        subtype = "light" if season == "spring" else "cool"
+
+    subtones = [(subtype, conf), ("neutral", 1.0 - conf)]
+    return season, conf, subtones
+
 
 def predict_skin_tone(image_pil: Image.Image, run_dir: str | None = None):
-    # 1) segmentation
+    # 1) segmentation & stabilization
     filled_pil, skin_mask = segment_face(image_pil)
     if run_dir:
         save_pil(filled_pil, os.path.join(run_dir, "02_segmented_filled.jpg"))
         save_np_mask(skin_mask, os.path.join(run_dir, "02a_skin_mask.png"))
 
-    # 2) AWB + exposure normalization on skin midtones
+    # 2) AWB + exposure normalization (light blend)
     filled_np = np.array(filled_pil)
-    stabilized_np = stabilize_skin_only_rgb(filled_np, skin_mask, v_range=(0.15, 0.85), s_min=0.10, target_V=0.55)
+    SLIGHT_BLEND_ALPHA = 0.2
+    stabilized_np = stabilize_skin_only_rgb(
+        rgb_uint8=filled_np,
+        skin_mask_uint8=skin_mask,
+        v_range=(0.15, 0.85),
+        s_min=0.10,
+        target_V=0.55,
+        blend_alpha=SLIGHT_BLEND_ALPHA
+    )
     stabilized_pil = pil_from_rgb(stabilized_np)
     if run_dir:
         save_pil(stabilized_pil, os.path.join(run_dir, "03_stabilized_for_gemini.jpg"))
 
-    # 3) JPEG bytes for Gemini
-    buf = io.BytesIO()
-    stabilized_pil.save(buf, format="JPEG", quality=85)
-    img_bytes = buf.getvalue()
+    # 3) === Local Prediction FIRST ===
+    local_season, local_confidence, local_subtones = predict_tone_local(stabilized_pil)
 
-    # 4) Gemini tone-only call
-    tone_out = analyze_tone_skin_only(img_bytes)
+    tone_out: Dict[str, Any] = {}
 
-    # 5) map outputs (same as before) ...
+    if local_confidence >= T_TONE_FALLBACK_CONF:
+        # Use Local Prediction
+        print(f"✅ Tone: Using Local Model ({local_season.capitalize()}, Conf: {local_confidence:.2f})")
+
+        # Format the local result to match Gemini's output structure
+        tone_out = {
+            "season": local_season.lower(),
+            "subtype": local_subtones[0][0],
+            "confidence": local_confidence,
+            "season_confidences": {local_season.lower(): local_confidence},
+            "top_2_seasons": [(local_season.lower(), local_confidence), ("neutral", 0.0)],
+            "top_2_subtones": local_subtones,
+            "hex_palette": ["#7C482B", "#A0522D", "#C68642", "#8B5C42", "#5C3317"],
+            # Fallback or look up a standard palette
+            "reasoning": f"Local model predicted {local_season.capitalize()} with confidence {local_confidence:.2f}."
+        }
+    else:
+        # 4) Fallback to Gemini
+        print(f"⚠️ Tone: Local confidence is low ({local_confidence:.2f}), falling back to Gemini API...")
+        buf = io.BytesIO()
+        stabilized_pil.save(buf, format="JPEG", quality=85)
+        img_bytes = buf.getvalue()
+        tone_out = analyze_tone_skin_only(img_bytes)
+
+    # 5) map outputs (common for both local and gemini results)
     main_season = tone_out.get("season", "spring")
     confidence = float(tone_out.get("confidence", 0.0))
     top_2_subtones = []
@@ -187,5 +256,5 @@ def predict_skin_tone(image_pil: Image.Image, run_dir: str | None = None):
 
     return (
         main_season, confidence, top_2_subtones, season_confidences, top_2_seasons, gemini_out,
-        filled_pil, stabilized_pil, skin_mask  # <- return intermediates for plotting
+        filled_pil, stabilized_pil, skin_mask
     )
